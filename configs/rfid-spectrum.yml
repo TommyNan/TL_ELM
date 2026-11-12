@@ -1,0 +1,59 @@
+exp_name: rfid_spectrum
+mode: train
+
+
+### Path settings
+data_params:
+  type: rfid
+  data_dir: './datasets/RFID/s23-dataset'
+  train_ratio: 0.8
+  scale_worldsize: 1
+
+### System settings
+sys_params:
+  seed: 42
+  device: 'cuda'
+
+
+### rendering settings
+render_params:
+  scale_worldsize: 1
+  near: 0
+  far: 5
+  num_points: 64
+
+
+### training settings
+train_params:
+  batch_size: 8192
+  lr: 8e-4
+#  lr: 3e-4
+  weight_decay: 5e-5
+  T_max: 10000
+  eps: 1e-7
+  eta_min: 1e-6
+#  eta_min: 3e-5
+  total_iters: 30000
+  load_checkpoint: False
+  save_freq: 100
+  val_freq: 2500
+  report_freq: 100
+
+
+### network settings
+model_params:
+  num_layers: 8
+  num_hidden: 256
+  skips: [4]
+  num_hidden_wesn: 128
+  connectivity: 0.8
+  leaky: 1.0
+  spectral_radius: 0.9
+  use_norm2: True
+  use_bias: True
+  win_len: 4
+  num_freq: {'pts': 10, 'view': 4, 'tx': 10}
+  input_dims: {'pts': 3, 'view': 3, 'tx': 3}
+  if_embeded: {'pts': True, 'view': True, 'tx': True}
+  attn_output_dims: 2
+  sig_output_dims: 2
