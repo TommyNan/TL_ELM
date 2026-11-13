@@ -201,22 +201,6 @@ class ESNCell(nn.Module):
 
         return new_state
 
-    # def get_config(self):
-    #     config = {
-    #         "hidden_dim": self.hidden_dim,
-    #         "connectivity": self.connectivity,
-    #         "leaky": self.leaky,
-    #         "spectral_radius": self.spectral_radius,
-    #         "use_norm2": self.use_norm2,
-    #         "use_bias": self.use_bias,
-    #         "activation": self.activation.__name__,  # e.g. "tanh"
-    #         "kernel_init": "xavier_uniform",
-    #         "recurrent_init": "xavier_uniform",
-    #         "bias_init": "zeros",
-    #     }
-    #     base_config = super().get_config()
-    #     return {**base_config, **config}
-
 
 class WESN(nn.Module):
     r"""
@@ -372,7 +356,7 @@ if __name__ == '__main__':
 
     print(h_next.shape)  # torch.Size([4, 32])
 
-    # ---- 超参数设置 ----
+    # ---- Hyperparameter Setting ----
     B = 4          # batch_size
     T = 10         # time_steps
     C = 8          # input_dim
@@ -380,7 +364,7 @@ if __name__ == '__main__':
     out_dim = 3    # output_dim per time step
     win_len = 3    # use x_t, x_{t-1}, x_{t-2}
 
-    # ---- 构造模型 ----
+    # ---- Construct the Model ----
     model = WESN(
         hidden_dim=H,
         connectivity=0.1,
@@ -398,25 +382,23 @@ if __name__ == '__main__':
 
     print(model)
 
-    # ---- 随机输入 ----
+    # ---- Random Input ----
     x = torch.randn(B, T, C)   # [B, T, C]
 
-    # ---- 前向传播 ----
+    # ---- Foward Propagation ----
     y = model(x)               # [B, T, out_dim]
     print(f"Input shape:  {x.shape}")
     print(f"Output shape: {y.shape}")
 
-    # 检查输出维度是否符合预期
+    # Check the dimensions of hte output
     assert y.shape == (B, T, out_dim), "Output shape mismatch!"
 
-    # ---- 简单 loss + 反向传播，确认梯度流动 ----
+    # ---- Simple loss + Back-propagation ----
     loss = y.mean()
     loss.backward()
 
     print("\nParameter gradients:")
     for name, param in model.named_parameters():
-        # ESNCell 的 W_in 和 W_h 是 requires_grad=False，
-        # 只应该看到 output_layer 的权重有梯度。
         print(
             f"{name:25s}  requires_grad={param.requires_grad},  "
             f"has_grad={param.grad is not None}"

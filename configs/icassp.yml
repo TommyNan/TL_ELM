@@ -1,0 +1,40 @@
+# Latest protocol: E2 scratch, E3 sequential transfer, E4 zero-shot.
+protocol: sequential_transfer
+data:
+  root: datasets/ICASSP2025_Paired_Scenes
+  source_band: f2
+  target_band: f3
+  # f2=1.8 GHz, f3=3.5 GHz.
+  source_frequency_ghz: 1.8
+  target_frequency_ghz: 3.5
+  train_fraction: 0.2
+  val_fraction: 0.0
+  support_fraction: 0.0
+model:
+  attenuation: wesn
+  num_rays: 8
+  num_samples: 16
+  hidden_dim: 32
+  num_freq: 4
+  context_dim: 0
+train:
+  pretrain_steps: 2000
+  target_steps: 2000
+  pretrain_lr: 0.001
+  target_lr: 0.001
+  # Same target optimizer settings for scratch and transfer by default.
+  finetune_lr: 0.001
+  weight_decay: 0.00001
+  batch_size: 128
+  eval_batch_size: 256
+  log_every: 100
+  max_eval_points: 0
+  seed: 42
+  device: auto
+  num_threads: 2
+baseline:
+  # Local residual IDW, using all f3 training observations as the search pool.
+  k: 32
+  power: 2.0
+  batch_size: 4096
+output_dir: runs/icassp-transfer-20pct
