@@ -1,15 +1,17 @@
-"""
-NeRF2-inspired radio map field.
+"""NeRF-inspired ray field and WESN radio-map model with two PL modes.
 
 The attenuation field is a WESN over ordered samples on receiver-centred rays.
-A radiance MLP supplies complex source terms conditioned on transmitter,
-frequency and sparse observation features. Finite-volume compositing gives
+A radiance MLP supplies log-relative-amplitude and phase terms conditioned on
+transmitter coordinates and carrier frequency. Finite-volume compositing gives
 E_r = sum_j T_j (1-exp(-sigma_j*ds_j)) a_j exp(i*phi_j),
-P = mean_r |E_r|^2. Prediction is FSPL(d,f) + calibration - 10 log10(P).
+P = mean_r |E_r|^2. The shared renderer returns -10 log10(P).
+RadioMapField either supervises that value as a residual and adds FSPL, or
+supervises it directly as complete path loss, according to prediction_mode.
 
-This is a learned path-loss surrogate with a free-space prior, not an exact
-reproduction of original NeRF2 or a complex-channel reconstruction. All ray
-lengths are finite and scene-bounded; the data supplies power labels only.
+Power is evaluated in a shifted log domain, so there is no arbitrary
+calibration offset or absolute power epsilon limiting the dB residual range.
+The forward API always returns complete path loss in dB. This is a model-guided PL
+surrogate, not an exact reproduction of NeRF2 or a complex-channel estimate.
 """
 from __future__ import annotations
 
@@ -19,14 +21,46 @@ from torch import nn
 from torch.nn import functional as F
 
 from Models.wesn import WESN
+from propagation import torch_frequency_feature, torch_fspl_db
 
 
-class RadioMapField(nn.Module):
-    """Predict path loss in dB from local metre coordinates and material maps.
+class SkipMLP(nn.Module):
+    """Pointwise attenuation MLP with the original NeRF2 skip placement.
 
-    ``geometry`` is [1, 2, H, W], raw reflectance/transmittance dB. Image row
-    increases with local y. Context is [B, context_dim]; zeros mean no observed
-    channels. Callers must never encode query labels in context.
+    NeRF2 concatenates the original encoded input *after* hidden layer 4
+    (zero-based), so hidden layer 5 receives ``hidden_dim + input_dim``.
+    Source: https://github.com/XPengZhao/NeRF2/blob/main/model.py .
+    The output head here provides one density plus radiance features for our
+    power-only renderer; it is not the original complex-channel output head.
+    """
+
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers=8, skips=(4,)):
+        super().__init__()
+        if num_layers < 1 or any(i < 0 or i >= num_layers - 1 for i in skips):
+            raise ValueError('Use positive mlp_num_layers and skips before its last layer')
+        self.skips = tuple(sorted(set(skips)))
+        self.linears = nn.ModuleList(
+            [nn.Linear(input_dim, hidden_dim)] +
+            [nn.Linear(hidden_dim + (input_dim if i - 1 in self.skips else 0), hidden_dim)
+             for i in range(1, num_layers)]
+        )
+        self.output_layer = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, inputs):
+        hidden = inputs
+        for i, layer in enumerate(self.linears):
+            hidden = F.relu(layer(hidden))
+            if i in self.skips:
+                hidden = torch.cat((inputs, hidden), dim=-1)
+        return self.output_layer(hidden)
+
+
+class RayField(nn.Module):
+    """Shared ray construction and learned power integration.
+
+    Scene width/height set the coordinate normalization and ray bounds.
+    Encoded coordinates and log carrier frequency condition the learned field.
+    No material map, observation context or per-query label is accepted.
     """
     def __init__(self, model_params: dict):
         super().__init__()
@@ -36,24 +70,21 @@ class RadioMapField(nn.Module):
         self.num_rays = int(model_params.get('num_rays', 8))
         hidden = int(model_params.get('hidden_dim', 32))
         self.num_freq = int(model_params.get('num_freq', 4))
-        self.context_dim = int(model_params.get('context_dim', 0))
         self.attenuation_kind = model_params.get('attenuation', 'wesn')
         win_len = int(model_params.get('win_len', 4))
-        if min(self.width_m, self.height_m) <= 0:
-            raise ValueError('scene extents must be positive')
         if self.num_samples < 1 or self.num_rays < 1 or hidden < 2 or self.num_freq < 0:
             raise ValueError('invalid ray, sample, hidden or encoding size')
-        if self.context_dim < 0 or win_len < 0 or win_len > self.num_samples:
-            raise ValueError('invalid context dimension or WESN window length')
+        if win_len < 0 or win_len > self.num_samples:
+            raise ValueError('invalid WESN window length')
         self.register_buffer('extent_m', torch.tensor([self.width_m, self.height_m, max(self.width_m, self.height_m)]))
         angles = torch.arange(self.num_rays, dtype=torch.float32) * (2 * math.pi / self.num_rays)
         self.register_buffer('directions', torch.stack([angles.cos(), angles.sin(), torch.zeros_like(angles)], -1))
         self.register_buffer('sample_fraction', (torch.arange(self.num_samples, dtype=torch.float32) + .5) / self.num_samples)
         self.register_buffer('encoding_frequencies', 2. ** torch.arange(self.num_freq, dtype=torch.float32))
         positional_dim = 3 * (1 + 2 * self.num_freq)
-        # Geometry and frequency belong to the attenuation field; observations
-        # condition the source/radiance branch rather than modifying the scene.
-        field_input_dim = positional_dim + 2 + 1
+        # The same coordinate/frequency information is available in every
+        # neural model; material maps and measured-label context are excluded.
+        field_input_dim = positional_dim + 1
         self.feature_dim = hidden
         if self.attenuation_kind == 'wesn':
             self.attenuation = WESN(
@@ -70,15 +101,17 @@ class RadioMapField(nn.Module):
             with torch.no_grad():
                 self.attenuation(torch.zeros(1, self.num_samples, field_input_dim))
         elif self.attenuation_kind == 'mlp':
-            self.attenuation = nn.Sequential(nn.Linear(field_input_dim, hidden), nn.SiLU(),
-                                             nn.Linear(hidden, hidden + 1))
+            self.attenuation = SkipMLP(
+                field_input_dim, hidden, hidden + 1,
+                num_layers=int(model_params.get('mlp_num_layers', 8)),
+                skips=model_params.get('mlp_skips', [4]),
+            )
         else:
             raise ValueError("attenuation must be 'wesn' or 'mlp'")
         self.radiance = nn.Sequential(
-            nn.Linear(hidden + 3 + 3 + 1 + self.context_dim, hidden), nn.SiLU(),
+            nn.Linear(hidden + 3 + 3 + 1, hidden), nn.SiLU(),
             nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, 2),
         )
-        self.calibration_db = nn.Parameter(torch.tensor(15.))
 
     def _encode(self, xyz):
         if self.num_freq == 0:
@@ -102,47 +135,76 @@ class RadioMapField(nn.Module):
         points = origin.unsqueeze(-2) + dirs.unsqueeze(-2) * (ray_length[..., None] * self.sample_fraction)[..., None]
         return points, dirs, ray_length
 
-    def forward(self, rx_m, tx_m, frequency_ghz, geometry, context=None):
-        """Return [B] path loss dB. rx_m/tx_m are [B,3] in local metres."""
-        if rx_m.ndim != 2 or rx_m.shape[-1] != 3 or tx_m.shape != rx_m.shape:
-            raise ValueError('rx_m and tx_m must have shape [B,3]')
-        if geometry.ndim != 4 or geometry.shape[:2] != (1, 2):
-            raise ValueError('geometry must have shape [1,2,H,W]')
+    def _render_loss_db(self, rx_m, tx_m, frequency_ghz):
+        """Integrate predicted power and return its negative dB logarithm.
+
+        RadioMapField interprets this value as full PL or a signed FSPL
+        correction, according to prediction_mode. Power-only labels do not
+        identify a unique latent phase or complex channel.
+        """
         batch = len(rx_m)
-        frequency = torch.as_tensor(frequency_ghz, device=rx_m.device, dtype=rx_m.dtype)
-        if frequency.numel() == 1:
-            frequency = frequency.reshape(1).expand(batch)
-        if frequency.shape != (batch,) or not bool(torch.all(frequency > 0)):
-            raise ValueError('frequency_ghz must be positive scalar or [B]')
-        if context is None:
-            context = rx_m.new_zeros(batch, self.context_dim)
-        if context.shape != (batch, self.context_dim):
-            raise ValueError('context has wrong shape')
+        frequency_feature = torch_frequency_feature(frequency_ghz, rx_m)
+        frequency_feature = frequency_feature.view(batch, 1, 1, 1).expand(
+            -1, self.num_rays, self.num_samples, -1)
         points, dirs, length = self._rays(rx_m)
         normalized = points / self.extent_m
-        grid = normalized[..., :2].reshape(1, batch * self.num_rays, self.num_samples, 2) * 2 - 1
-        materials = F.grid_sample(geometry, grid, mode='bilinear', padding_mode='border', align_corners=True)
-        materials = materials[0].permute(1, 2, 0).reshape(batch, self.num_rays, self.num_samples, 2) / 60.
-        freq_feature = torch.log(frequency / 3.5).view(batch, 1, 1, 1).expand(-1, self.num_rays, self.num_samples, -1)
-        field_input = torch.cat((self._encode(normalized), materials, freq_feature), -1)
+        field_input = torch.cat((self._encode(normalized), frequency_feature), dim=-1)
         field = self.attenuation(field_input.reshape(batch * self.num_rays, self.num_samples, -1))
         field = field.reshape(batch, self.num_rays, self.num_samples, -1)
         sigma = F.softplus(field[..., 0])
         ds = length[..., None] / (max(self.width_m, self.height_m) * self.num_samples)
         optical_depth = sigma * ds
-        transmittance = torch.exp(-(optical_depth.cumsum(-1) - optical_depth))
-        alpha = -torch.expm1(-optical_depth)
+        log_transmittance = -torch.cat((torch.zeros_like(optical_depth[..., :1]),
+                                        optical_depth.cumsum(-1)[..., :-1]), dim=-1)
+        # Machine tiny only handles a representational zero in log/complex
+        # arithmetic. It is not an absolute received-power floor such as 1e-8.
+        tiny = torch.finfo(optical_depth.dtype).tiny
+        log_alpha = torch.log((-torch.expm1(-optical_depth)).clamp_min(tiny))
         tx_feature = (tx_m / self.extent_m).view(batch, 1, 1, 3).expand(-1, self.num_rays, self.num_samples, -1)
         view_feature = dirs.unsqueeze(-2).expand(-1, -1, self.num_samples, -1)
-        observed = context.view(batch, 1, 1, self.context_dim).expand(-1, self.num_rays, self.num_samples, -1)
-        radiance = self.radiance(torch.cat((field[..., 1:], tx_feature, view_feature, freq_feature, observed), -1))
-        amplitude = F.softplus(radiance[..., 0])
+        radiance = self.radiance(torch.cat((field[..., 1:], tx_feature, view_feature, frequency_feature), -1))
+        log_amplitude = radiance[..., 0]
         phase = math.pi * torch.tanh(radiance[..., 1])
-        weighted_amp = transmittance * alpha * amplitude
-        # Real form of the complex integral avoids unnecessary complex autograd.
-        real = (weighted_amp * phase.cos()).sum(-1)
-        imag = (weighted_amp * phase.sin()).sum(-1)
-        power = (real.square() + imag.square()).mean(-1)
-        distance_m = (tx_m - rx_m).norm(dim=-1).clamp_min(.25)
-        fspl_db = 20 * torch.log10(distance_m) + 20 * torch.log10(frequency) + 32.4478
-        return fspl_db + self.calibration_db - 10 * torch.log10(power + 1e-8)
+        log_weighted_amp = log_transmittance + log_alpha + log_amplitude
+        shift = log_weighted_amp.max(dim=-1, keepdim=True).values
+        scaled_amp = torch.exp(log_weighted_amp - shift)
+        # Coherent sum within each ray, followed by an incoherent mean of ray
+        # powers, as in this fixed power-map renderer. Max shifting preserves
+        # both very small and large relative gains without exponent overflow.
+        real = (scaled_amp * phase.cos()).sum(-1)
+        imag = (scaled_amp * phase.sin()).sum(-1)
+        log_ray_power = 2 * shift.squeeze(-1) + torch.log(
+            (real.square() + imag.square()).clamp_min(tiny))
+        log_relative_power = torch.logsumexp(log_ray_power, dim=-1) - math.log(self.num_rays)
+        # Natural-log power to dB: this is the unit conversion, not an
+        # adjustable output multiplier or label normalization.
+        return -(10.0 / math.log(10.0)) * log_relative_power
+
+
+class RadioMapField(RayField):
+    """WESN complete PL prediction, with an optional analytical FSPL prior.
+
+    ``fspl_residual`` (default) adds FSPL to the learned signed dB correction.
+    ``direct_pl`` learns complete PL dB directly and never evaluates FSPL.
+    Both modes share the same field structure and receive full PL labels.
+    """
+
+    def __init__(self, model_params):
+        super().__init__(model_params)
+        self.prediction_mode = model_params.get('prediction_mode', 'fspl_residual')
+
+    def forward(self, rx_m, tx_m, frequency_ghz):
+        if self.prediction_mode == 'fspl_residual':
+            residual = self.predict_residual_db(rx_m, tx_m, frequency_ghz)
+            return torch_fspl_db(rx_m, tx_m, frequency_ghz) + residual
+        return self._render_loss_db(rx_m, tx_m, frequency_ghz)
+
+    def predict_path_loss_db(self, rx_m, tx_m, frequency_ghz):
+        """Return complete PL dB in either selected prediction mode."""
+        return self.forward(rx_m, tx_m, frequency_ghz)
+
+    def predict_residual_db(self, rx_m, tx_m, frequency_ghz):
+        """Return the signed FSPL correction, only in fspl_residual mode."""
+        if self.prediction_mode != 'fspl_residual':
+            raise ValueError('predict_residual_db is unavailable in direct_pl mode, which predicts full PL')
+        return self._render_loss_db(rx_m, tx_m, frequency_ghz)

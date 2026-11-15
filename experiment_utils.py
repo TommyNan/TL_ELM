@@ -1,10 +1,48 @@
 """Shared runtime, reproducibility and scoring utilities for ICASSP experiments."""
 
 import hashlib
+from pathlib import Path
+import platform
 import random
 
 import numpy as np
 import torch
+
+
+METRIC_FIELDS = ("rmse_db", "mae_db", "train_time_sec", "test_time_sec")
+
+
+def file_fingerprint(root, paths):
+    """Content fingerprint independent of the machine's absolute checkout path."""
+    root = Path(root)
+    digest = hashlib.sha256()
+    for path in sorted(map(Path, paths), key=lambda p: p.relative_to(root).as_posix()):
+        digest.update(path.relative_to(root).as_posix().encode())
+        digest.update(b'\0')
+        digest.update(path.read_bytes())
+        digest.update(b'\0')
+    return digest.hexdigest()
+
+
+def reproducibility_metadata(project_root, dataset_root, scenes, source_band, target_band, device):
+    """Record code/data identity and runtime versions without environment secrets."""
+    project_root, dataset_root = Path(project_root), Path(dataset_root)
+    sources = [project_root / name for name in ('main.py', 'propagation.py', 'experiment_utils.py')]
+    for directory in ('Models', 'baselines', 'datasets'):
+        sources.extend((project_root / directory).glob('*.py'))
+    data = [dataset_root / 'positions.csv', dataset_root / 'building_details.csv']
+    for scene in sorted(scenes):
+        for band in (source_band, target_band):
+            data.append(dataset_root / scene / f'{band}_path_loss.png')
+    selected_device = torch.device(device)
+    return {'source_sha256': file_fingerprint(project_root, sources),
+            'dataset_sha256': file_fingerprint(dataset_root, data),
+            'python_version': platform.python_version(), 'platform': platform.system(),
+            'torch_version': str(torch.__version__), 'numpy_version': str(np.__version__),
+            'device': str(selected_device), 'cuda_runtime_version': torch.version.cuda,
+            'cuda_device_name': (torch.cuda.get_device_name(selected_device)
+                                 if selected_device.type == 'cuda' else None),
+            'cuda_bitwise_determinism_guaranteed': False}
 
 
 def seed_everything(seed):
@@ -21,37 +59,19 @@ def scene_seed(seed, scene_id):
 
 def metrics(prediction, target):
     error = np.asarray(prediction, dtype=np.float64) - np.asarray(target, dtype=np.float64)
-    if not error.size or not np.isfinite(error).all():
-        raise ValueError("Cannot score empty or nonfinite predictions")
     return {"rmse_db": float(np.sqrt(np.mean(error**2))),
-            "mae_db": float(np.mean(np.abs(error))),
-            "bias_db": float(np.mean(error)), "n_points": int(error.size)}
+            "mae_db": float(np.mean(np.abs(error))), "n_points": int(error.size)}
 
 
 def aggregate_results(rows):
-    """Primary result is equal scene weighting, never pixel-count weighting."""
+    """Average each of the four metrics equally over scenes."""
     result = {}
     for approach in sorted({row["approach"] for row in rows}):
-        selected = [r for r in rows if r["approach"] == approach]
-        entry = {"n_scenes": len(selected),
-                 "n_buildings": len({r["building_id"] for r in selected})}
-        for name in ("rmse_db", "mae_db", "bias_db"):
-            values = np.array([r[name] for r in selected])
-            entry["scene_mean_" + name] = float(values.mean())
-            entry["scene_std_" + name] = float(values.std())
-        building_rmse = [np.mean([r["rmse_db"] for r in selected if r["building_id"] == b])
-                         for b in sorted({r["building_id"] for r in selected})]
-        entry["building_mean_rmse_db"] = float(np.mean(building_rmse))
-        entry["pooled_rmse_db"] = float(np.sqrt(
-            sum(r["rmse_db"]**2 * r["n_points"] for r in selected) /
-            sum(r["n_points"] for r in selected)))
-        result[approach] = entry
+        selected = [row for row in rows if row["approach"] == approach]
+        result[approach] = {"n_scenes": len(selected),
+                            **{name: float(np.mean([row[name] for row in selected]))
+                               for name in METRIC_FIELDS}}
     return result
-
-
-def as_geometry(array, device):
-    return torch.as_tensor(np.ascontiguousarray(array.transpose(2, 0, 1)[None]),
-                           dtype=torch.float32, device=device)
 
 
 def choose_device(value):
@@ -60,3 +80,10 @@ def choose_device(value):
     if value == "cuda" and not torch.cuda.is_available():
         raise ValueError("CUDA requested but unavailable")
     return torch.device(value)
+
+
+def sync_if_cuda(device):
+    """Finish pending GPU work before a performance timing boundary."""
+    selected = torch.device(device)
+    if selected.type == "cuda":
+        torch.cuda.synchronize(selected)

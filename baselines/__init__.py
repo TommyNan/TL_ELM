@@ -1,5 +1,8 @@
-"""Non-neural reference methods for radio-map experiments."""
+"""Analytical FSPL, direct KNN and target-band neural reference models."""
 
-from .fspl_idw import FSPLIDW, fspl_db
+from .fspl import FSPL
+from .knn import KNN
+from .mlp import MLP
+from .nerf2 import NeRF2
 
-__all__ = ["FSPLIDW", "fspl_db"]
+__all__ = ["FSPL", "KNN", "MLP", "NeRF2"]
