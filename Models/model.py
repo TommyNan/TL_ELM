@@ -4,14 +4,17 @@ The attenuation field is a WESN over ordered samples on receiver-centred rays.
 A radiance MLP supplies log-relative-amplitude and phase terms conditioned on
 transmitter coordinates and carrier frequency. Finite-volume compositing gives
 E_r = sum_j T_j (1-exp(-sigma_j*ds_j)) a_j exp(i*phi_j),
-P = mean_r |E_r|^2. The shared renderer returns -10 log10(P).
-RadioMapField either supervises that value as a residual and adds FSPL, or
-supervises it directly as complete path loss, according to prediction_mode.
+P = mean_r |E_r|^2. The shared renderer returns the score -10 log10(P).
+With per-band min/max statistics, forward returns normalized PL. In residual
+mode it adds the renderer score to normalized FSPL; inverse normalization gives
+PL = FSPL + span_db * score. Direct mode inverse-normalizes the score itself.
+The rendered latent power is not a calibrated physical power ratio.
 
 Power is evaluated in a shifted log domain, so there is no arbitrary
 calibration offset or absolute power epsilon limiting the dB residual range.
-The forward API always returns complete path loss in dB. This is a model-guided PL
-surrogate, not an exact reproduction of NeRF2 or a complex-channel estimate.
+Without a scaler, the original dB training space is retained. The explicit
+predict_path_loss_db API always returns complete physical PL dB. This is a
+model-guided surrogate, not an exact reproduction of NeRF2 or a CSI estimate.
 """
 from __future__ import annotations
 
@@ -21,7 +24,34 @@ from torch import nn
 from torch.nn import functional as F
 
 from Models.wesn import WESN
+from datasets.normalization import BandMinMax
 from propagation import torch_frequency_feature, torch_fspl_db
+
+
+def _log_alpha(raw_density, ds, optical_depth):
+    """Compute log(1-exp(-softplus(raw)*ds)) without a huge 1/alpha gradient.
+
+    In the small-depth limit log(alpha) equals log(depth) to float32 accuracy.
+    Safe inputs in the unselected branches also keep their backward pass finite.
+    The existing machine-tiny alpha threshold is preserved in the log domain.
+    """
+    cutoff = -20.0
+    log_sigma = torch.where(raw_density < cutoff, raw_density,
+                            F.softplus(raw_density.clamp_min(cutoff)).log())
+    log_depth = log_sigma + ds.log()
+    small = log_depth < cutoff
+    regular_depth = torch.where(small, torch.ones_like(optical_depth), optical_depth)
+    log_alpha = torch.where(small, log_depth, (-torch.expm1(-regular_depth)).log())
+    return log_alpha.clamp_min(math.log(torch.finfo(raw_density.dtype).tiny))
+
+
+def _log_power(real, imag, tiny):
+    """Accumulate the small coherent remainder in double precision.
+
+    A finite float32 remainder can have a finite log-power but an overflowing
+    intermediate derivative through square/log. Keep the original tiny floor.
+    """
+    return (real.to(torch.float64).square() + imag.to(torch.float64).square()).clamp_min(tiny).log()
 
 
 class SkipMLP(nn.Module):
@@ -64,6 +94,7 @@ class RayField(nn.Module):
     """
     def __init__(self, model_params: dict):
         super().__init__()
+        self.pl_scaler = BandMinMax(model_params.get('label_normalization'))
         self.width_m = float(model_params['width_m'])
         self.height_m = float(model_params['height_m'])
         self.num_samples = int(model_params.get('num_samples', 16))
@@ -135,12 +166,12 @@ class RayField(nn.Module):
         points = origin.unsqueeze(-2) + dirs.unsqueeze(-2) * (ray_length[..., None] * self.sample_fraction)[..., None]
         return points, dirs, ray_length
 
-    def _render_loss_db(self, rx_m, tx_m, frequency_ghz):
-        """Integrate predicted power and return its negative dB logarithm.
+    def _render_score(self, rx_m, tx_m, frequency_ghz):
+        """Integrate latent power and return its negative logarithmic score.
 
-        RadioMapField interprets this value as full PL or a signed FSPL
-        correction, according to prediction_mode. Power-only labels do not
-        identify a unique latent phase or complex channel.
+        RadioMapField interprets the score as full normalized PL or a signed
+        correction in the same normalized units. Without a scaler its units
+        remain dB. PL-only labels do not identify a unique latent phase or CSI.
         """
         batch = len(rx_m)
         frequency_feature = torch_frequency_feature(frequency_ghz, rx_m)
@@ -156,10 +187,10 @@ class RayField(nn.Module):
         optical_depth = sigma * ds
         log_transmittance = -torch.cat((torch.zeros_like(optical_depth[..., :1]),
                                         optical_depth.cumsum(-1)[..., :-1]), dim=-1)
-        # Machine tiny only handles a representational zero in log/complex
-        # arithmetic. It is not an absolute received-power floor such as 1e-8.
+        # Machine tiny protects representational zeros, not an adjustable
+        # received-power floor. Evaluate its logarithm without reciprocal overflow.
         tiny = torch.finfo(optical_depth.dtype).tiny
-        log_alpha = torch.log((-torch.expm1(-optical_depth)).clamp_min(tiny))
+        log_alpha = _log_alpha(field[..., 0], ds, optical_depth)
         tx_feature = (tx_m / self.extent_m).view(batch, 1, 1, 3).expand(-1, self.num_rays, self.num_samples, -1)
         view_feature = dirs.unsqueeze(-2).expand(-1, -1, self.num_samples, -1)
         radiance = self.radiance(torch.cat((field[..., 1:], tx_feature, view_feature, frequency_feature), -1))
@@ -173,20 +204,19 @@ class RayField(nn.Module):
         # both very small and large relative gains without exponent overflow.
         real = (scaled_amp * phase.cos()).sum(-1)
         imag = (scaled_amp * phase.sin()).sum(-1)
-        log_ray_power = 2 * shift.squeeze(-1) + torch.log(
-            (real.square() + imag.square()).clamp_min(tiny))
+        log_ray_power = 2 * shift.squeeze(-1).to(torch.float64) + _log_power(real, imag, tiny)
         log_relative_power = torch.logsumexp(log_ray_power, dim=-1) - math.log(self.num_rays)
-        # Natural-log power to dB: this is the unit conversion, not an
-        # adjustable output multiplier or label normalization.
-        return -(10.0 / math.log(10.0)) * log_relative_power
+        # Inverse normalization is applied by the explicit physical-dB APIs.
+        return (-(10.0 / math.log(10.0)) * log_relative_power).to(field.dtype)
 
 
 class RadioMapField(RayField):
-    """WESN complete PL prediction, with an optional analytical FSPL prior.
+    """WESN complete PL regression, with an optional analytical FSPL prior.
 
-    ``fspl_residual`` (default) adds FSPL to the learned signed dB correction.
-    ``direct_pl`` learns complete PL dB directly and never evaluates FSPL.
-    Both modes share the same field structure and receive full PL labels.
+    Forward uses normalized labels when per-band statistics are supplied.
+    ``fspl_residual`` adds normalized FSPL and a normalized learned correction;
+    ``direct_pl`` regresses full normalized PL and never evaluates FSPL.
+    The explicit prediction APIs return physical dB in either configuration.
     """
 
     def __init__(self, model_params):
@@ -195,16 +225,17 @@ class RadioMapField(RayField):
 
     def forward(self, rx_m, tx_m, frequency_ghz):
         if self.prediction_mode == 'fspl_residual':
-            residual = self.predict_residual_db(rx_m, tx_m, frequency_ghz)
-            return torch_fspl_db(rx_m, tx_m, frequency_ghz) + residual
-        return self._render_loss_db(rx_m, tx_m, frequency_ghz)
+            prior = self.pl_scaler.normalize(torch_fspl_db(rx_m, tx_m, frequency_ghz), frequency_ghz)
+            return prior + self._render_score(rx_m, tx_m, frequency_ghz)
+        return self._render_score(rx_m, tx_m, frequency_ghz)
 
     def predict_path_loss_db(self, rx_m, tx_m, frequency_ghz):
-        """Return complete PL dB in either selected prediction mode."""
-        return self.forward(rx_m, tx_m, frequency_ghz)
+        """Undo the selected band's label normalization in either mode."""
+        return self.pl_scaler.denormalize(self(rx_m, tx_m, frequency_ghz), frequency_ghz)
 
     def predict_residual_db(self, rx_m, tx_m, frequency_ghz):
         """Return the signed FSPL correction, only in fspl_residual mode."""
         if self.prediction_mode != 'fspl_residual':
             raise ValueError('predict_residual_db is unavailable in direct_pl mode, which predicts full PL')
-        return self._render_loss_db(rx_m, tx_m, frequency_ghz)
+        return self.pl_scaler.denormalize_residual(
+            self._render_score(rx_m, tx_m, frequency_ghz), frequency_ghz)

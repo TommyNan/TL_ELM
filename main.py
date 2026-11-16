@@ -9,6 +9,7 @@ predict PL; MLP and the independent NeRF2 baseline always predict PL directly.
 """
 
 import argparse
+import copy
 import csv
 import hashlib
 import json
@@ -24,9 +25,9 @@ from Models.model import RadioMapField
 from baselines.fspl import FSPL
 from baselines.knn import KNN
 from baselines.mlp import MLP
-from baselines.nerf2 import NeRF2Field
-from datasets.data_loader import discover_scenes, load_scene
-from experiment_utils import (aggregate_results, choose_device, metrics,
+from baselines.nerf2 import NeRF2
+from datasets.data_loader import compute_pl_minmax, discover_scenes, load_scene
+from experiment_utils import (aggregate_results, choose_device, clip_grad_norm, metrics,
                               reproducibility_metadata, scene_seed, seed_everything, sync_if_cuda)
 from propagation import WESN_PREDICTION_MODES, require_wesn_prediction_mode
 
@@ -34,7 +35,6 @@ from propagation import WESN_PREDICTION_MODES, require_wesn_prediction_mode
 PROJECT_ROOT = Path(__file__).resolve().parent
 METHODS = ("E2_scratch", "E3_transfer", "E4_zero_shot")
 BASELINES = ("E1_fspl", "B1_knn", "B2_mlp", "B3_nerf2")
-NEURAL_BASELINES = ("B2_mlp", "B3_nerf2")
 
 
 def make_train_test_split(valid_mask, train_fraction, seed):
@@ -65,13 +65,13 @@ def copy_state(model):
 
 def new_model(params, seed, device, model_type="radio_map"):
     seed_everything(seed)
-    factories = {"radio_map": RadioMapField, "plain_mlp": PlainMLP, "nerf2": NeRF2Field}
+    factories = {"radio_map": RadioMapField, "plain_mlp": MLP, "nerf2": NeRF2}
     return factories[model_type](params).to(device)
 
 
 def fit_field(model, rx_m, tx_m, frequency_ghz, labels_db,
               training, steps, lr, batch_seed, stage=None):
-    """Fit from explicitly sliced training arrays; no held-out labels accepted.
+    """Fit training observations in the model's normalized output space.
 
     A new Adam optimizer is created for every stage, including fine-tuning.
     E2/E3 use the same batch seed, target step count and default learning rate.
@@ -81,6 +81,12 @@ def fit_field(model, rx_m, tx_m, frequency_ghz, labels_db,
     rx = torch.as_tensor(rx_m, dtype=torch.float32, device=device)
     tx = torch.as_tensor(tx_m, dtype=torch.float32, device=device)
     labels = torch.as_tensor(labels_db, dtype=torch.float32, device=device)
+    scaler = getattr(model, "pl_scaler", None)
+    normalized = scaler is not None and scaler.enabled
+    if normalized:
+        labels = scaler.normalize(labels, frequency_ghz)
+    loss_key = "train_mse_normalized" if normalized else "train_mse_db2"
+    loss_unit = "normalized PL" if normalized else "dB^2"
     optimizer = torch.optim.Adam([p for p in model.parameters() if p.requires_grad],
                                  lr=float(lr), weight_decay=float(training["weight_decay"]))
     rng = np.random.default_rng(batch_seed)
@@ -94,31 +100,38 @@ def fit_field(model, rx_m, tx_m, frequency_ghz, labels_db,
         prediction = model(rx[index], tx.expand(len(index), -1), frequency_ghz)
         loss = (prediction - labels[index]).square().mean()
         if not bool(torch.isfinite(loss)):
-            raise RuntimeError(f"Nonfinite loss at step {step}")
+            raise RuntimeError(f"{stage or type(model).__name__}: nonfinite loss at step {step}/{steps}")
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), training["gradient_clip_norm"],
-                                       error_if_nonfinite=True)
+        try:
+            loss.backward()
+            clip_grad_norm(model.parameters(), training["gradient_clip_norm"])
+        except RuntimeError as error:
+            bad_parameter = next((name for name, p in model.named_parameters()
+                                  if p.grad is not None and not bool(torch.isfinite(p.grad).all())), None)
+            detail = f"; nonfinite gradient in {bad_parameter}" if bad_parameter else ""
+            raise RuntimeError(f"{stage or type(model).__name__}: step {step}/{steps}, "
+                               f"loss={loss.item():.6g}{detail}. {error}") from error
         optimizer.step()
         if step == 1 or step % training["log_every"] == 0 or step == steps:
-            entry = {"step": step, "train_mse_db2": float(loss.item())}
+            entry = {"step": step, loss_key: float(loss.item())}
             history.append(entry)
             if stage:
-                print(f'{stage}: step {step}/{steps}, train MSE={loss.item():.4f} dB^2', flush=True)
+                print(f'{stage}: step {step}/{steps}, train MSE={loss.item():.6f} ({loss_unit})', flush=True)
     sync_if_cuda(device)
     return history, time.perf_counter() - start
 
 
 def predict_field(model, rx_m, tx_m, frequency_ghz, batch_size):
-    """Pure prediction; neither source nor target path-loss labels are inputs."""
+    """Return physical PL dB using the saved, frequency-specific inverse scale."""
     device = next(model.parameters()).device
+    predictor = getattr(model, "predict_path_loss_db", model)
     result = []
     model.eval()
     with torch.no_grad():
         for start in range(0, len(rx_m), batch_size):
             rx = torch.as_tensor(rx_m[start:start + batch_size], dtype=torch.float32, device=device)
             tx = torch.as_tensor(tx_m, dtype=torch.float32, device=device).expand(len(rx), -1)
-            prediction = model(rx, tx, frequency_ghz)
+            prediction = predictor(rx, tx, frequency_ghz)
             result.append(prediction.cpu().numpy())
     return np.concatenate(result) if result else np.empty(0, dtype=np.float32)
 
@@ -165,7 +178,8 @@ def run_scene(scene, split, methods, config, out, device, seed, baseline_names, 
                         source_train=train_indices, target_train=train_indices,
                         test_evaluation=test_indices)
     params = dict(config["model"], width_m=scene.width_m, height_m=scene.height_m,
-                  prediction_mode=prediction_mode)
+                  prediction_mode=prediction_mode,
+                  label_normalization=config.get("label_normalization"))
     source_state, source_hash = None, None
     source_seconds = 0.0
     if "E3_transfer" in methods or "E4_zero_shot" in methods:
@@ -312,6 +326,7 @@ def write_results(out, rows, baselines, inventory, selected, methods, baseline_n
                   expected_runs=expected,
                   include_baselines=bool(baseline_names), baseline_names=list(baseline_names),
                   wesn_prediction_mode=(config["model"].get("prediction_mode", "fspl_residual") if methods else None),
+                  label_normalization=config.get("label_normalization"),
                   seed=config["train"]["seed"], train_fraction=config["data"]["train_fraction"],
                   completed_baseline_runs=len(baselines),
                   expected_baseline_runs=len(selected) * len(baseline_names),
@@ -325,6 +340,7 @@ def write_results(out, rows, baselines, inventory, selected, methods, baseline_n
 
 
 def run(config, scenes=None, methods=METHODS, include_baselines=False, inspect_only=False, baselines=None):
+    config = copy.deepcopy(config)
     validate_config(config)
     methods = list(methods)
     baseline_names = list(BASELINES if include_baselines else ()) if baselines is None else list(baselines)
@@ -340,6 +356,13 @@ def run(config, scenes=None, methods=METHODS, include_baselines=False, inspect_o
     selected = list(available if scenes is None else scenes)
     if not selected or len(set(selected)) != len(selected) or any(s not in available for s in selected):
         raise ValueError("Choose distinct scene IDs from the dataset")
+    # These global per-band statistics are explicitly assumed known, including
+    # target-band test extrema. They are shared by every scene and every seed.
+    neural = bool(methods or set(baseline_names) & {"B2_mlp", "B3_nerf2"})
+    config["label_normalization"] = (compute_pl_minmax(dataset_root, {
+        config["data"]["source_band"]: config["data"]["source_frequency_ghz"],
+        config["data"]["target_band"]: config["data"]["target_frequency_ghz"],
+    }) if neural else None)
     torch.set_num_threads(config["train"]["num_threads"])
     device = choose_device(config["train"]["device"])
     out = Path(config["output_dir"])
@@ -352,6 +375,8 @@ def run(config, scenes=None, methods=METHODS, include_baselines=False, inspect_o
                                                config['data']['source_band'],
                                                config['data']['target_band'], device)
         (out / "config.yml").write_text(yaml.safe_dump(config, sort_keys=False))
+        if config["label_normalization"] is not None:
+            (out / "label_normalization.json").write_text(json.dumps(config["label_normalization"], indent=2))
         (out / "runtime.json").write_text(json.dumps(provenance, indent=2))
         print(f'Runtime: {provenance["torch_version"]}, device={device}, '
               f'GPU={provenance["cuda_device_name"]}, code={provenance["source_sha256"][:12]}', flush=True)
@@ -379,6 +404,7 @@ def run(config, scenes=None, methods=METHODS, include_baselines=False, inspect_o
                                    baseline_names, config, provenance)
     if inspect_only:
         report = dict(n_scenes=len(inventory), n_buildings=len({s["building_id"] for s in inventory}),
+                      label_normalization=config["label_normalization"],
                       wesn_prediction_mode=config["model"].get("prediction_mode", "fspl_residual"),
                       inventory=inventory, source_frequency_ghz=config["data"]["source_frequency_ghz"],
                       target_frequency_ghz=config["data"]["target_frequency_ghz"])
@@ -455,7 +481,7 @@ def main():
         config["model"]["prediction_mode"] = args.wesn_mode
         if args.output_dir is None:
             percentage = f'{config["data"]["train_fraction"] * 100:g}'
-            config["output_dir"] = f'runs/wesn-{args.wesn_mode.replace("_", "-")}-{percentage}pct'
+            config["output_dir"] = f'runs/wesn-{args.wesn_mode.replace("_", "-")}-minmax-{percentage}pct'
     run(config, args.scenes, [] if args.baseline_only else args.methods,
         args.include_baselines or args.baseline_only, args.inspect, baselines=args.baselines)
 

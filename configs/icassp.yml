@@ -20,8 +20,8 @@ model:
   # Coordinate Fourier scales; carrier frequency is a separate log-frequency feature.
   num_freq: 4
 train:
-  pretrain_steps: 2000
-  target_steps: 2000
+  pretrain_steps: 10000
+  target_steps: 10000
   pretrain_lr: 0.001
   target_lr: 0.001
   # Same target optimizer settings for scratch and transfer by default.
@@ -51,4 +51,4 @@ baseline_models:
     hidden_dim: 256
     mlp_num_layers: 8
     mlp_skips: [4]
-output_dir: runs/wesn-fspl-residual-10pct
+output_dir: runs/wesn-fspl-residual-minmax-10pct

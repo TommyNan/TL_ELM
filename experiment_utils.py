@@ -82,6 +82,29 @@ def choose_device(value):
     return torch.device(value)
 
 
+@torch.no_grad()
+def clip_grad_norm(parameters, max_norm):
+    """Clip gradients, retrying the norm in float64 if float32 overflows.
+
+    The usual PyTorch path handles normal gradients. Large but finite
+    gradients can overflow its sum of squares; only that case is retried.
+    Actual NaN/Inf gradients still stop training before an optimizer update.
+    """
+    parameters = list(parameters)
+    try:
+        return torch.nn.utils.clip_grad_norm_(parameters, max_norm, error_if_nonfinite=True)
+    except RuntimeError:
+        gradients = [p.grad for p in parameters if p.grad is not None]
+        norms = torch.stack([torch.linalg.vector_norm(g.double()) for g in gradients])
+        total_norm = torch.linalg.vector_norm(norms)
+        if not bool(torch.isfinite(total_norm)):
+            raise
+        coefficient = (max_norm / (total_norm + 1e-6)).clamp(max=1.)
+        for gradient in gradients:
+            gradient.copy_((gradient.double() * coefficient).to(gradient.dtype))
+        return total_norm
+
+
 def sync_if_cuda(device):
     """Finish pending GPU work before a performance timing boundary."""
     selected = torch.device(device)

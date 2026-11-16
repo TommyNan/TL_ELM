@@ -127,6 +127,7 @@ def collect_panels(run_dir, scene_id, device='auto'):
                            'values': values, 'rmse_db': rmse})
     metadata = {'scene_id': scene_id, 'run_dir': str(root), 'seed': config['train']['seed'],
                 'wesn_prediction_mode': prediction_mode if selected.intersection(WESN_METHODS) else None,
+                'label_normalization': summary.get('label_normalization'),
                 'target_frequency_ghz': config['data']['target_frequency_ghz'],
                 'height': scene.height, 'width': scene.width, 'n_valid': int(mask.sum()),
                 'n_training_measurements': measurement_count, 'n_allocated_training_positions': len(train),

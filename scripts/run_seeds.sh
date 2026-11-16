@@ -28,7 +28,7 @@ TRAIN_FRACTION="${TRAIN_FRACTION:-0.1}"
 CONFIG="${CONFIG:-configs/icassp.yml}"
 # An unset WESN_MODE preserves model.prediction_mode from the selected YAML.
 WESN_MODE="${WESN_MODE:-}"
-OUT_ROOT="${OUT_ROOT:-runs/wesn-seeds-10pct}"
+OUT_ROOT="${OUT_ROOT:-runs/wesn-minmax-seeds-10pct}"
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONUNBUFFERED=1
 
@@ -39,6 +39,13 @@ if [[ -n "$WESN_MODE" ]]; then
     *) printf '%s\n' 'WESN_MODE must be fspl_residual or direct_pl.' >&2; exit 2 ;;
   esac
 fi
+
+BASELINE_ARGS=()
+case "${INCLUDE_BASELINES:-1}" in
+  1) BASELINE_ARGS=(--include-baselines) ;;
+  0) ;;
+  *) printf '%s\n' 'INCLUDE_BASELINES must be 0 or 1.' >&2; exit 2 ;;
+esac
 
 if [[ -n "${RECEIVER_MASK:-}" ]]; then
   printf '%s\n' 'Coordinate/frequency experiments do not select receivers by material; RECEIVER_MASK is unsupported.' >&2
@@ -84,7 +91,7 @@ fi
 mkdir -p -- "$OUT_ROOT/logs"
 for (( seed=SEED_START; seed<=SEED_END; seed++ )); do
   printf 'Running seed %s (%s..%s), train_fraction=%s\n' "$seed" "$SEED_START" "$SEED_END" "$TRAIN_FRACTION"
-  "$PYTHON_BIN" main.py --config "$CONFIG" --include-baselines "${MODE_ARGS[@]}" "$@" \
+  "$PYTHON_BIN" main.py --config "$CONFIG" "${BASELINE_ARGS[@]}" "${MODE_ARGS[@]}" "$@" \
     --seed "$seed" --train-fraction "$TRAIN_FRACTION" --output-dir "$OUT_ROOT/seed_$seed" \
     2>&1 | tee "$OUT_ROOT/logs/seed_$seed.log"
 done
