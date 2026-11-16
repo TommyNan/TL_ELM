@@ -1,9 +1,6 @@
 """Compare ICASSP FSPL, KNN, MLP and NeRF2 on matched held-out receivers.
 
-One invocation runs one seed on all selected scenes. Use sweep_baselines.sh
-for seeds 0..9, or --aggregate-only to summarize completed repetitions.
-Training reuses the project's fixed PL protocol; no WESN or source pretraining
-is constructed, and no validation labels or material inputs are introduced.
+Use sweep_baselines.sh for seeds 0..9, or --aggregate-only to summarize completed repetitions.
 """
 from __future__ import annotations
 
@@ -19,8 +16,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import yaml
 
-from baselines.common import (METHOD_IDS, aggregate_baseline_sweep,
-                              normalize_methods, save_baseline_summary)
+from baselines.common import (aggregate_baseline_sweep, normalize_methods,
+                              save_baseline_summary)
 from main import run
 
 
@@ -35,6 +32,11 @@ def run_comparison(config, scenes=None, methods=None, *, seed=None, output_dir=N
     report = run(configuration, scenes, methods=[], baselines=selected)
     save_baseline_summary(configuration['output_dir'], report)
     return report
+
+
+def update_config(section, **overrides):
+    """Apply supplied CLI options, keeping all other YAML settings."""
+    section.update({key: value for key, value in overrides.items() if value is not None})
 
 
 def build_parser():
@@ -94,24 +96,16 @@ def main(argv=None):
         config_path = Path(args.config) if args.config else PROJECT_ROOT / 'configs/icassp.yml'
         with config_path.open() as stream:
             config = yaml.safe_load(stream)
-        if not isinstance(config, dict):
-            raise ValueError('Configuration must be a YAML mapping')
-        config['train']['seed'] = 0 if args.seed is None else args.seed
-        for name in ('device', 'target_steps', 'batch_size', 'eval_batch_size', 'weight_decay',
-                     'num_threads', 'max_eval_points'):
-            value = getattr(args, name)
-            if value is not None:
-                config['train'][name] = value
-        if args.lr is not None:
-            config['train']['target_lr'] = args.lr
-        if args.train_fraction is not None:
-            config['data']['train_fraction'] = args.train_fraction
-        if args.dataset_root is not None:
-            config['data']['root'] = args.dataset_root
-        if args.k is not None:
-            config.setdefault('baseline', {}).setdefault('knn', {})['k'] = args.k
+        update_config(config['train'],
+                      seed=0 if args.seed is None else args.seed,
+                      device=args.device, target_steps=args.target_steps,
+                      batch_size=args.batch_size, eval_batch_size=args.eval_batch_size,
+                      target_lr=args.lr, weight_decay=args.weight_decay,
+                      num_threads=args.num_threads, max_eval_points=args.max_eval_points)
+        update_config(config['data'], train_fraction=args.train_fraction, root=args.dataset_root)
+        update_config(config['baseline']['knn'], k=args.k)
         config['output_dir'] = (args.output_dir if args.output_dir is not None else
-                                str(PROJECT_ROOT / 'runs/baseline-comparison' /
+                                str(PROJECT_ROOT / 'runs/baseline-comparison-minmax' /
                                     f'seed_{config["train"]["seed"]}'))
         print(f'Baselines only: {", ".join(selected)}; seed={config["train"]["seed"]}', flush=True)
         report = run_comparison(config, args.scenes, selected)

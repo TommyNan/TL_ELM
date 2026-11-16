@@ -1,107 +1,98 @@
-"""Average scenes within each seed, then report mean and sample std over seeds."""
+"""Four-metric baseline reports with equal scene weighting and seed repetitions."""
 from __future__ import annotations
 
-import argparse
-import csv
 import json
 from pathlib import Path
-import sys
 
 import numpy as np
-import yaml
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
 from experiment_utils import METRIC_FIELDS
+from scripts.aggregate_seeds import (_read_rows, _statistics, _write_csv,
+                                     aggregate as aggregate_seed_reports)
 
 
-def _read_rows(path, scenes, methods):
-    """Read four metrics and require the complete scene/method matrix."""
-    if not methods:
-        return []
-    with Path(path).open(newline='') as stream:
-        rows = list(csv.DictReader(stream))
-    actual = [(row['scene_id'], row['approach']) for row in rows]
-    expected = {(scene, method) for scene in scenes for method in methods}
-    if len(actual) != len(expected) or set(actual) != expected:
-        raise ValueError(f'{path}: incomplete or repeated scene/method results')
-    for row in rows:
-        row.update({field: float(row[field]) for field in METRIC_FIELDS})
-    return rows
+METHOD_IDS = {'fspl': 'E1_fspl', 'knn': 'B1_knn', 'mlp': 'B2_mlp', 'nerf2': 'B3_nerf2'}
+_METHOD_NAMES = {value: key for key, value in METHOD_IDS.items()}
 
 
-def _statistics(values):
-    values = np.asarray(values, dtype=np.float64)
-    return {'mean': float(values.mean()),
-            'std': float(values.std(ddof=1)) if len(values) > 1 else 0.0}
+def normalize_methods(names=None):
+    """Resolve CLI names or experiment IDs in the requested order."""
+    if names is None:
+        return list(METHOD_IDS.values())
+    aliases = {**METHOD_IDS, **{key.lower(): key for key in _METHOD_NAMES}}
+    names = [names] if isinstance(names, str) else names
+    try:
+        methods = [aliases[name.lower()] for name in names]
+    except (KeyError, AttributeError) as error:
+        raise ValueError(f'Choose baseline methods from {list(METHOD_IDS)}') from error
+    if not methods or len(set(methods)) != len(methods):
+        raise ValueError('Choose at least one baseline, without duplicates')
+    return methods
 
 
-def _write_csv(path, rows):
-    if rows:
-        with Path(path).open('w', newline='') as stream:
-            writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
-            writer.writeheader()
-            writer.writerows(rows)
+def _write_json(path, value):
+    Path(path).write_text(json.dumps(value, indent=2) + '\n')
 
 
-def aggregate(root, seeds=range(10), output_dir=None):
-    """Keep seeds as repetitions; weight scenes equally inside every seed."""
+def _read_baseline_run(run_dir, summary=None):
+    run_dir = Path(run_dir)
+    summary = summary if summary is not None else json.loads((run_dir / 'summary.json').read_text())
+    if not summary['complete'] or summary['methods']:
+        raise ValueError(f'{run_dir}: a completed baseline-only run is required')
+    rows = _read_rows(run_dir / 'baseline_per_scene.csv', summary['selected_scenes'],
+                      list(summary['baselines']))
+    selected = [dict(seed=summary['seed'], scene_id=row['scene_id'], building_id=row['building_id'],
+                     method=_METHOD_NAMES[row['approach']], approach=row['approach'],
+                     **{field: row[field] for field in METRIC_FIELDS}) for row in rows]
+    return summary, selected
+
+
+def save_baseline_summary(run_dir, report):
+    """Save the four scene-mean metrics plus individual scene results."""
+    run_dir = Path(run_dir)
+    path = run_dir / 'baseline_summary.json'
+    if path.exists():
+        raise ValueError(f'Baseline summary already exists: {path}')
+    summary, rows = _read_baseline_run(run_dir, report)
+    result = dict(complete=True, seed=summary['seed'], selected_scenes=summary['selected_scenes'],
+                  label_normalization=summary.get('label_normalization'),
+                  evaluation_limited=summary['evaluation_limited'],
+                  aggregation='equal scene weighting within this seed', baselines={})
+    for method in summary['baselines']:
+        selected = [row for row in rows if row['approach'] == method]
+        result['baselines'][_METHOD_NAMES[method]] = dict(
+            approach=method,
+            **{field: float(np.mean([row[field] for row in selected])) for field in METRIC_FIELDS},
+            per_scene={row['scene_id']: {field: row[field] for field in METRIC_FIELDS}
+                       for row in selected})
+    _write_json(path, result)
+    return result
+
+
+def aggregate_baseline_sweep(root, seeds=range(10), output_dir=None):
+    """Report each scene over seeds, then scene macro means over seeds."""
     root, seeds = Path(root), list(seeds)
-    if not seeds or len(set(seeds)) != len(seeds) or min(seeds) < 0:
-        raise ValueError('Choose distinct nonnegative seeds')
-    out = Path(output_dir) if output_dir is not None else root / 'seed_summary'
-    if out.exists() and any(out.iterdir()):
-        raise ValueError(f'Output directory is nonempty: {out}')
-    per_seed, reference = [], None
-    for seed in seeds:
-        run_dir = root / f'seed_{seed}'
-        summary = json.loads((run_dir / 'summary.json').read_text())
-        config = yaml.safe_load((run_dir / 'config.yml').read_text())
-        if not summary['complete']:
-            raise ValueError(f'Seed {seed} is incomplete')
-        scenes, methods = summary['selected_scenes'], summary['methods']
-        baselines = list(summary.get('baselines', {}))
-        mode = config.get('model', {}).get('prediction_mode', 'fspl_residual') if methods else None
-        scope = (tuple(sorted(scenes)), tuple(sorted(methods)), tuple(sorted(baselines)), mode)
-        if reference is not None and scope != reference:
-            raise ValueError('Seeds must use the same scenes, methods and WESN mode')
-        reference = scope
-        for group, selected_methods, filename in (
-                ('main_experiments', methods, 'main_per_scene.csv'),
-                ('baselines', baselines, 'baseline_per_scene.csv')):
-            rows = _read_rows(run_dir / filename, scenes, selected_methods)
-            for method in selected_methods:
-                selected = [row for row in rows if row['approach'] == method]
-                per_seed.append(dict(seed=seed, group=group, approach=method,
-                                     n_scenes=len(selected),
-                                     **{field: float(np.mean([row[field] for row in selected]))
-                                        for field in METRIC_FIELDS}))
-    report = dict(seeds=seeds, n_seeds=len(seeds), n_scenes_per_seed=len(scenes),
-                  wesn_prediction_mode=mode, evaluation_limited=summary['evaluation_limited'],
-                  aggregation='equal scene means within seeds; mean and sample std across seeds',
-                  std_ddof=1 if len(seeds) > 1 else 0, main_experiments={}, baselines={})
-    for group, method in sorted({(row['group'], row['approach']) for row in per_seed}):
-        selected = [row for row in per_seed if row['group'] == group and row['approach'] == method]
-        report[group][method] = {
-            field: _statistics([row[field] for row in selected]) for field in METRIC_FIELDS}
-    out.mkdir(parents=True, exist_ok=True)
-    _write_csv(out / 'per_seed.csv', per_seed)
-    (out / 'summary.json').write_text(json.dumps(report, indent=2))
-    print(f'Aggregated {len(seeds)} seeds, {len(scenes)} scenes each: {out}')
+    out = Path(output_dir) if output_dir is not None else root / 'sweep_summary'
+    all_rows = [row for seed in seeds for row in _read_baseline_run(root / f'seed_{seed}')[1]]
+    # The shared seed aggregator checks completeness and mode selection once.
+    report = aggregate_seed_reports(root, seeds, out)
+    scenes = sorted({row['scene_id'] for row in all_rows})
+    methods = sorted({row['approach'] for row in all_rows})
+    per_scene, scene_rows = {}, []
+    for scene in scenes:
+        per_scene[scene] = {}
+        for method in methods:
+            selected = [row for row in all_rows if row['scene_id'] == scene and row['approach'] == method]
+            statistics = {field: _statistics([row[field] for row in selected]) for field in METRIC_FIELDS}
+            per_scene[scene][_METHOD_NAMES[method]] = dict(approach=method, **statistics)
+            row = dict(scene_id=scene, method=_METHOD_NAMES[method], approach=method, n_seeds=len(seeds))
+            for field, values in statistics.items():
+                row[field + '_mean'], row[field + '_std'] = values['mean'], values['std']
+            scene_rows.append(row)
+    report.update(complete=True, comparison='baselines_only', per_scene=per_scene,
+                  n_scene_seed_method_runs=len(all_rows))
+    _write_csv(out / 'per_scene_seed.csv', all_rows)
+    _write_csv(out / 'per_scene_summary.csv', scene_rows)
+    _write_json(out / 'summary.json', report)
+    print(f'Baseline comparison: {len(scenes)} scenes × {len(seeds)} seeds × {len(methods)} methods: {out}')
     return report
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--root', required=True)
-    parser.add_argument('--seed-start', type=int, default=0)
-    parser.add_argument('--seed-end', type=int, default=9, help='Inclusive: 0..9 is ten seeds')
-    parser.add_argument('--output-dir')
-    args = parser.parse_args()
-    aggregate(args.root, range(args.seed_start, args.seed_end + 1), args.output_dir)
-
-
-if __name__ == '__main__':
-    main()

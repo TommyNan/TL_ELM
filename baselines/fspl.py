@@ -15,7 +15,7 @@ class FSPL:
         tx = np.asarray(tx_m, dtype=np.float64).copy()
         frequency = float(frequency_ghz)
         if tx.shape != (3,):
-            raise ValueError("tx_m must be finite with shape [3]")
+            raise ValueError("tx_m must have shape [3]")
         tx.setflags(write=False)
         self.tx_m = tx
         self.frequency_ghz = frequency
