@@ -6,11 +6,9 @@ input skip after zero-based layer 4. This file contains its network, coordinate
 encoding, finite rays and power renderer, with no dependency on Models/.
 
 Only Tx/Rx coordinates and carrier frequency are inputs. The power renderer
-supplies a scalar regression score, -10 log10(P_latent). With per-band min/max
-normalization that score represents normalized PL; physical PL is recovered by
-min_db + span_db * score. The latent power is therefore not itself a calibrated
-received/transmitted power ratio. Without normalization, the score is PL dB.
-No FSPL or residual target is used in this baseline.
+directly predicts complete PL in dB as -10 log10(P_latent). Training uses the
+original PL labels with MSE in dB squared. No label normalization, FSPL prior
+or residual target is used in this baseline.
 This remains an adaptation for scalar PL, not the original full CSI pipeline;
 PL-only labels do not uniquely identify latent phase or complex channels.
 """
@@ -21,7 +19,6 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from datasets.normalization import BandMinMax
 from propagation import torch_frequency_feature
 
 
@@ -64,7 +61,6 @@ class NeRF2(nn.Module):
     """
     def __init__(self, model_params: dict):
         super().__init__()
-        self.pl_scaler = BandMinMax(model_params.get('label_normalization'))
         self.width_m = float(model_params['width_m'])
         self.height_m = float(model_params['height_m'])
         self.num_samples = int(model_params.get('num_samples', 16))
@@ -117,11 +113,7 @@ class NeRF2(nn.Module):
         return points, dirs, ray_length
 
     def _render_score(self, rx_m, tx_m, frequency_ghz):
-        """Integrate latent power and return its negative logarithmic score.
-
-        This score uses normalized PL units when a scaler is supplied, and dB
-        otherwise. PL-only labels do not uniquely identify latent phase or CSI.
-        """
+        """Integrate latent power and return complete path loss in dB."""
         batch = len(rx_m)
         frequency_feature = torch_frequency_feature(frequency_ghz, rx_m)
         frequency_feature = frequency_feature.view(batch, 1, 1, 1).expand(
@@ -131,17 +123,19 @@ class NeRF2(nn.Module):
         field_input = torch.cat((self._encode(normalized), frequency_feature), dim=-1)
         field = self.attenuation(field_input.reshape(batch * self.num_rays, self.num_samples, -1))
         field = field.reshape(batch, self.num_rays, self.num_samples, -1)
-        sigma = F.softplus(field[..., 0])
-        ds = length[..., None] / (max(self.width_m, self.height_m) * self.num_samples)
+        # Keep the renderer in float64: log(alpha) can have an overflowing
+        # float32 intermediate gradient even when the PL and loss are finite.
+        sigma = F.softplus(field[..., 0].double())
+        ds = length[..., None].double() / (max(self.width_m, self.height_m) * self.num_samples)
         optical_depth = sigma * ds
         log_transmittance = -torch.cat((torch.zeros_like(optical_depth[..., :1]),
                                         optical_depth.cumsum(-1)[..., :-1]), dim=-1)
         # Machine tiny prevents log(0), without setting a physical power floor.
-        tiny = torch.finfo(optical_depth.dtype).tiny
+        tiny = torch.finfo(field.dtype).tiny
         log_alpha = (-torch.expm1(-optical_depth)).clamp_min(tiny).log()
         tx_feature = (tx_m / self.extent_m).view(batch, 1, 1, 3).expand(-1, self.num_rays, self.num_samples, -1)
         view_feature = dirs.unsqueeze(-2).expand(-1, -1, self.num_samples, -1)
-        radiance = self.radiance(torch.cat((field[..., 1:], tx_feature, view_feature, frequency_feature), -1))
+        radiance = self.radiance(torch.cat((field[..., 1:], tx_feature, view_feature, frequency_feature), -1)).double()
         log_amplitude = radiance[..., 0]
         phase = math.pi * torch.tanh(radiance[..., 1])
         log_weighted_amp = log_transmittance + log_alpha + log_amplitude
@@ -154,15 +148,14 @@ class NeRF2(nn.Module):
         imag = (scaled_amp * phase.sin()).sum(-1)
         log_ray_power = 2 * shift.squeeze(-1) + (real.square() + imag.square()).clamp_min(tiny).log()
         log_relative_power = torch.logsumexp(log_ray_power, dim=-1) - math.log(self.num_rays)
-        # The latent score retains the logarithmic renderer. Its label units
-        # are set by training; predict_path_loss_db applies the inverse scaler.
-        return -(10.0 / math.log(10.0)) * log_relative_power
+        # Natural-log power to path loss in dB.
+        return (-(10.0 / math.log(10.0)) * log_relative_power).to(field.dtype)
 
     def forward(self, rx_m, tx_m, frequency_ghz):
-        """Return [B] complete PL in the configured training-label space."""
+        """Return [B] complete PL in dB."""
         return self._render_score(rx_m, tx_m, frequency_ghz)
 
     def predict_path_loss_db(self, rx_m, tx_m, frequency_ghz):
-        """Undo the selected band's label normalization, without an FSPL prior."""
-        return self.pl_scaler.denormalize(self(rx_m, tx_m, frequency_ghz), frequency_ghz)
+        """Return the direct dB prediction without any inverse scaling."""
+        return self(rx_m, tx_m, frequency_ghz)
 

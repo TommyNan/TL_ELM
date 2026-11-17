@@ -27,9 +27,10 @@ from baselines.knn import KNN
 from baselines.mlp import MLP
 from baselines.nerf2 import NeRF2
 from datasets.data_loader import compute_pl_minmax, discover_scenes, load_scene
+from datasets.normalization import BandMinMax
 from experiment_utils import (aggregate_results, choose_device, clip_grad_norm, metrics,
                               reproducibility_metadata, scene_seed, seed_everything, sync_if_cuda)
-from propagation import WESN_PREDICTION_MODES, require_wesn_prediction_mode
+from propagation import WESN_PREDICTION_MODES, numpy_fspl_db, require_wesn_prediction_mode
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -71,7 +72,7 @@ def new_model(params, seed, device, model_type="radio_map"):
 
 def fit_field(model, rx_m, tx_m, frequency_ghz, labels_db,
               training, steps, lr, batch_seed, stage=None):
-    """Fit training observations in the model's normalized output space.
+    """Fit training observations in the model's label space.
 
     A new Adam optimizer is created for every stage, including fine-tuning.
     E2/E3 use the same batch seed, target step count and default learning rate.
@@ -121,10 +122,10 @@ def fit_field(model, rx_m, tx_m, frequency_ghz, labels_db,
     return history, time.perf_counter() - start
 
 
-def predict_field(model, rx_m, tx_m, frequency_ghz, batch_size):
-    """Return physical PL dB using the saved, frequency-specific inverse scale."""
+def predict_field(model, rx_m, tx_m, frequency_ghz, batch_size, *, predictor=None):
+    """Return physical PL dB, applying inverse scaling only when the model uses it."""
     device = next(model.parameters()).device
-    predictor = getattr(model, "predict_path_loss_db", model)
+    predictor = predictor or getattr(model, "predict_path_loss_db", model)
     result = []
     model.eval()
     with torch.no_grad():
@@ -178,8 +179,8 @@ def run_scene(scene, split, methods, config, out, device, seed, baseline_names, 
                         source_train=train_indices, target_train=train_indices,
                         test_evaluation=test_indices)
     params = dict(config["model"], width_m=scene.width_m, height_m=scene.height_m,
-                  prediction_mode=prediction_mode,
-                  label_normalization=config.get("label_normalization"))
+                  prediction_mode=prediction_mode)
+    params.pop("label_normalization", None)
     source_state, source_hash = None, None
     source_seconds = 0.0
     if "E3_transfer" in methods or "E4_zero_shot" in methods:
@@ -266,6 +267,9 @@ def run_scene(scene, split, methods, config, out, device, seed, baseline_names, 
                         else {"hidden_dim": 256, "mlp_num_layers": 8, "mlp_skips": [4]})
             baseline_params = dict(params, **defaults)
             baseline_params.update(config.get("baseline_models", {}).get(name, {}))
+            baseline_params.pop("label_normalization", None)
+            if model_type == "plain_mlp":
+                baseline_params["label_normalization"] = config.get("label_normalization")
             model = new_model(baseline_params, seed, device, model_type)
             initial_digest = state_digest(model.state_dict())
             target_steps = training["target_steps"]
@@ -327,6 +331,7 @@ def write_results(out, rows, baselines, inventory, selected, methods, baseline_n
                   include_baselines=bool(baseline_names), baseline_names=list(baseline_names),
                   wesn_prediction_mode=(config["model"].get("prediction_mode", "fspl_residual") if methods else None),
                   label_normalization=config.get("label_normalization"),
+                  normalized_methods=["B2_mlp"] if "B2_mlp" in baseline_names else [],
                   seed=config["train"]["seed"], train_fraction=config["data"]["train_fraction"],
                   completed_baseline_runs=len(baselines),
                   expected_baseline_runs=len(selected) * len(baseline_names),
@@ -358,11 +363,11 @@ def run(config, scenes=None, methods=METHODS, include_baselines=False, inspect_o
         raise ValueError("Choose distinct scene IDs from the dataset")
     # These global per-band statistics are explicitly assumed known, including
     # target-band test extrema. They are shared by every scene and every seed.
-    neural = bool(methods or set(baseline_names) & {"B2_mlp", "B3_nerf2"})
+    normalized = "B2_mlp" in baseline_names
     config["label_normalization"] = (compute_pl_minmax(dataset_root, {
         config["data"]["source_band"]: config["data"]["source_frequency_ghz"],
         config["data"]["target_band"]: config["data"]["target_frequency_ghz"],
-    }) if neural else None)
+    }) if normalized else None)
     torch.set_num_threads(config["train"]["num_threads"])
     device = choose_device(config["train"]["device"])
     out = Path(config["output_dir"])
@@ -425,11 +430,23 @@ def predict_checkpoint(checkpoint_path, output_path, device="auto"):
     model = new_model(checkpoint["model_params"], config["train"]["seed"], choose_device(device),
                        model_type)
     model.load_state_dict(checkpoint["state_dict"], strict=True)
+    # Restore the output units of older normalized ray-model checkpoints.
+    legacy_scale = BandMinMax(checkpoint["model_params"].get("label_normalization"))
+    legacy_ray = model_type in ("nerf2", "radio_map") and legacy_scale.enabled
+    legacy_residual = legacy_ray and model_type == "radio_map" and prediction_mode == "fspl_residual"
+    predictor = model.predict_residual_db if legacy_residual else None
     indices = np.flatnonzero(scene.valid_mask)
     prediction = np.full(scene.height * scene.width, np.nan, dtype=np.float32)
     prediction[indices] = predict_field(model, scene.rx_m[indices], scene.tx_m,
                                        config["data"]["target_frequency_ghz"],
-                                       config["train"]["eval_batch_size"])
+                                       config["train"]["eval_batch_size"], predictor=predictor)
+    if legacy_residual:
+        prior = numpy_fspl_db(scene.rx_m[indices], scene.tx_m, config["data"]["target_frequency_ghz"])
+        prediction[indices] = prior + legacy_scale.denormalize_residual(
+            prediction[indices], config["data"]["target_frequency_ghz"])
+    elif legacy_ray:
+        prediction[indices] = legacy_scale.denormalize(
+            prediction[indices], config["data"]["target_frequency_ghz"])
     output.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(output, prediction_db=prediction.reshape(scene.height, scene.width),
                         wesn_prediction_mode=prediction_mode if model_type == "radio_map" else "",
@@ -481,7 +498,7 @@ def main():
         config["model"]["prediction_mode"] = args.wesn_mode
         if args.output_dir is None:
             percentage = f'{config["data"]["train_fraction"] * 100:g}'
-            config["output_dir"] = f'runs/wesn-{args.wesn_mode.replace("_", "-")}-minmax-{percentage}pct'
+            config["output_dir"] = f'runs/wesn-{args.wesn_mode.replace("_", "-")}-raw-pl-{percentage}pct'
     run(config, args.scenes, [] if args.baseline_only else args.methods,
         args.include_baselines or args.baseline_only, args.inspect, baselines=args.baselines)
 

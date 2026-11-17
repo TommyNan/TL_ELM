@@ -5,15 +5,13 @@ A radiance MLP supplies log-relative-amplitude and phase terms conditioned on
 transmitter coordinates and carrier frequency. Finite-volume compositing gives
 E_r = sum_j T_j (1-exp(-sigma_j*ds_j)) a_j exp(i*phi_j),
 P = mean_r |E_r|^2. The shared renderer returns the score -10 log10(P).
-With per-band min/max statistics, forward returns normalized PL. In residual
-mode it adds the renderer score to normalized FSPL; inverse normalization gives
-PL = FSPL + span_db * score. Direct mode inverse-normalizes the score itself.
+Direct mode fits complete PL in dB. Residual mode adds the learned dB
+correction to FSPL: PL = FSPL + score. Both modes use the original PL labels.
 The rendered latent power is not a calibrated physical power ratio.
 
 Power is evaluated in a shifted log domain, so there is no arbitrary
 calibration offset or absolute power epsilon limiting the dB residual range.
-Without a scaler, the original dB training space is retained. The explicit
-predict_path_loss_db API always returns complete physical PL dB. This is a
+The predict_path_loss_db API returns complete physical PL dB. This is a
 model-guided surrogate, not an exact reproduction of NeRF2 or a CSI estimate.
 """
 from __future__ import annotations
@@ -24,7 +22,6 @@ from torch import nn
 from torch.nn import functional as F
 
 from Models.wesn import WESN
-from datasets.normalization import BandMinMax
 from propagation import torch_frequency_feature, torch_fspl_db
 
 
@@ -94,7 +91,6 @@ class RayField(nn.Module):
     """
     def __init__(self, model_params: dict):
         super().__init__()
-        self.pl_scaler = BandMinMax(model_params.get('label_normalization'))
         self.width_m = float(model_params['width_m'])
         self.height_m = float(model_params['height_m'])
         self.num_samples = int(model_params.get('num_samples', 16))
@@ -169,9 +165,8 @@ class RayField(nn.Module):
     def _render_score(self, rx_m, tx_m, frequency_ghz):
         """Integrate latent power and return its negative logarithmic score.
 
-        RadioMapField interprets the score as full normalized PL or a signed
-        correction in the same normalized units. Without a scaler its units
-        remain dB. PL-only labels do not identify a unique latent phase or CSI.
+        RadioMapField interprets the score as complete PL or a signed FSPL
+        correction, both in dB. PL labels do not identify unique phase or CSI.
         """
         batch = len(rx_m)
         frequency_feature = torch_frequency_feature(frequency_ghz, rx_m)
@@ -206,17 +201,15 @@ class RayField(nn.Module):
         imag = (scaled_amp * phase.sin()).sum(-1)
         log_ray_power = 2 * shift.squeeze(-1).to(torch.float64) + _log_power(real, imag, tiny)
         log_relative_power = torch.logsumexp(log_ray_power, dim=-1) - math.log(self.num_rays)
-        # Inverse normalization is applied by the explicit physical-dB APIs.
+        # Natural-log power to the dB regression output.
         return (-(10.0 / math.log(10.0)) * log_relative_power).to(field.dtype)
 
 
 class RadioMapField(RayField):
     """WESN complete PL regression, with an optional analytical FSPL prior.
 
-    Forward uses normalized labels when per-band statistics are supplied.
-    ``fspl_residual`` adds normalized FSPL and a normalized learned correction;
-    ``direct_pl`` regresses full normalized PL and never evaluates FSPL.
-    The explicit prediction APIs return physical dB in either configuration.
+    ``fspl_residual`` adds FSPL and a learned correction in dB;
+    ``direct_pl`` regresses complete PL in dB and never evaluates FSPL.
     """
 
     def __init__(self, model_params):
@@ -225,17 +218,16 @@ class RadioMapField(RayField):
 
     def forward(self, rx_m, tx_m, frequency_ghz):
         if self.prediction_mode == 'fspl_residual':
-            prior = self.pl_scaler.normalize(torch_fspl_db(rx_m, tx_m, frequency_ghz), frequency_ghz)
+            prior = torch_fspl_db(rx_m, tx_m, frequency_ghz)
             return prior + self._render_score(rx_m, tx_m, frequency_ghz)
         return self._render_score(rx_m, tx_m, frequency_ghz)
 
     def predict_path_loss_db(self, rx_m, tx_m, frequency_ghz):
-        """Undo the selected band's label normalization in either mode."""
-        return self.pl_scaler.denormalize(self(rx_m, tx_m, frequency_ghz), frequency_ghz)
+        """Return complete PL in dB without inverse scaling."""
+        return self(rx_m, tx_m, frequency_ghz)
 
     def predict_residual_db(self, rx_m, tx_m, frequency_ghz):
         """Return the signed FSPL correction, only in fspl_residual mode."""
         if self.prediction_mode != 'fspl_residual':
             raise ValueError('predict_residual_db is unavailable in direct_pl mode, which predicts full PL')
-        return self.pl_scaler.denormalize_residual(
-            self._render_score(rx_m, tx_m, frequency_ghz), frequency_ghz)
+        return self._render_score(rx_m, tx_m, frequency_ghz)
