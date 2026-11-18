@@ -46,53 +46,83 @@ def _write_csv(path, rows):
             writer.writerows(rows)
 
 
-def aggregate(root, seeds=range(10), output_dir=None):
-    """Keep seeds as repetitions; weight scenes equally inside every seed."""
+def aggregate(root, seeds=range(10), output_dir=None, scenes=None):
+    """Summarize each scene across seeds, then equal scene means within seeds."""
     root, seeds = Path(root), list(seeds)
     if not seeds or len(set(seeds)) != len(seeds) or min(seeds) < 0:
         raise ValueError('Choose distinct nonnegative seeds')
     out = Path(output_dir) if output_dir is not None else root / 'seed_summary'
     if out.exists() and any(out.iterdir()):
         raise ValueError(f'Output directory is nonempty: {out}')
-    per_seed, reference = [], None
+    per_seed, per_scene_seed, reference = [], [], None
     for seed in seeds:
         run_dir = root / f'seed_{seed}'
         summary = json.loads((run_dir / 'summary.json').read_text())
         config = yaml.safe_load((run_dir / 'config.yml').read_text())
         if not summary['complete']:
             raise ValueError(f'Seed {seed} is incomplete')
-        scenes, methods = summary['selected_scenes'], summary['methods']
+        run_scenes, methods = summary['selected_scenes'], summary['methods']
+        selected_scenes = list(run_scenes if scenes is None else scenes)
+        if (not selected_scenes or len(set(selected_scenes)) != len(selected_scenes)
+                or not set(selected_scenes).issubset(run_scenes)):
+            raise ValueError(f'Choose distinct scenes from {run_scenes}')
         baselines = list(summary.get('baselines', {}))
         mode = config.get('model', {}).get('prediction_mode', 'fspl_residual') if methods else None
         normalization = summary.get('label_normalization')
-        scope = (tuple(sorted(scenes)), tuple(sorted(methods)), tuple(sorted(baselines)),
-                 mode, normalization)
+        # Older min-max runs normalized NeRF2 as well as MLP and WESN.
+        normalized_methods = summary.get('normalized_methods',
+                                        methods + [b for b in baselines if b in ('B2_mlp', 'B3_nerf2')]
+                                        if normalization else [])
+        scope = (tuple(sorted(run_scenes)), tuple(sorted(methods)), tuple(sorted(baselines)),
+                 mode, normalization, tuple(sorted(normalized_methods)))
         if reference is not None and scope != reference:
             raise ValueError('Seeds must use the same scenes, methods, WESN mode and label normalization')
         reference = scope
         for group, selected_methods, filename in (
                 ('main_experiments', methods, 'main_per_scene.csv'),
                 ('baselines', baselines, 'baseline_per_scene.csv')):
-            rows = _read_rows(run_dir / filename, scenes, selected_methods)
+            rows = _read_rows(run_dir / filename, run_scenes, selected_methods)
+            rows = [row for row in rows if row['scene_id'] in selected_scenes]
+            per_scene_seed.extend(dict(seed=seed, group=group, scene_id=row['scene_id'],
+                                       building_id=row['building_id'], approach=row['approach'],
+                                       **{field: row[field] for field in METRIC_FIELDS})
+                                  for row in rows)
             for method in selected_methods:
                 selected = [row for row in rows if row['approach'] == method]
                 per_seed.append(dict(seed=seed, group=group, approach=method,
                                      n_scenes=len(selected),
                                      **{field: float(np.mean([row[field] for row in selected]))
                                         for field in METRIC_FIELDS}))
-    report = dict(seeds=seeds, n_seeds=len(seeds), n_scenes_per_seed=len(scenes),
+    report = dict(seeds=seeds, n_seeds=len(seeds), n_scenes_per_seed=len(selected_scenes),
+                  selected_scenes=selected_scenes,
                   wesn_prediction_mode=mode, evaluation_limited=summary['evaluation_limited'],
                   label_normalization=normalization,
+                  normalized_methods=normalized_methods,
                   aggregation='equal scene means within seeds; mean and sample std across seeds',
-                  std_ddof=1 if len(seeds) > 1 else 0, main_experiments={}, baselines={})
+                  std_ddof=1 if len(seeds) > 1 else 0, main_experiments={}, baselines={},
+                  per_scene={})
     for group, method in sorted({(row['group'], row['approach']) for row in per_seed}):
         selected = [row for row in per_seed if row['group'] == group and row['approach'] == method]
         report[group][method] = {
             field: _statistics([row[field] for row in selected]) for field in METRIC_FIELDS}
+    scene_rows = []
+    for scene, group, method in sorted({(row['scene_id'], row['group'], row['approach'])
+                                       for row in per_scene_seed}):
+        selected = [row for row in per_scene_seed
+                    if (row['scene_id'], row['group'], row['approach']) == (scene, group, method)]
+        statistics = {field: _statistics([row[field] for row in selected]) for field in METRIC_FIELDS}
+        report['per_scene'].setdefault(scene, {'main_experiments': {}, 'baselines': {}})[group][method] = statistics
+        row = dict(scene_id=scene, building_id=selected[0]['building_id'], group=group,
+                   approach=method, n_seeds=len(selected))
+        for field, values in statistics.items():
+            row[field + '_mean'], row[field + '_std'] = values['mean'], values['std']
+        scene_rows.append(row)
     out.mkdir(parents=True, exist_ok=True)
     _write_csv(out / 'per_seed.csv', per_seed)
+    _write_csv(out / 'per_scene_seed.csv', per_scene_seed)
+    _write_csv(out / 'per_scene_summary.csv', scene_rows)
     (out / 'summary.json').write_text(json.dumps(report, indent=2))
-    print(f'Aggregated {len(seeds)} seeds, {len(scenes)} scenes each: {out}')
+    print(f'Aggregated {len(seeds)} seeds, {len(selected_scenes)} scenes each: {out}')
     return report
 
 
@@ -102,8 +132,9 @@ def main():
     parser.add_argument('--seed-start', type=int, default=0)
     parser.add_argument('--seed-end', type=int, default=9, help='Inclusive: 0..9 is ten seeds')
     parser.add_argument('--output-dir')
+    parser.add_argument('--scenes', nargs='+', help='Summarize only these scenes; default: all completed scenes')
     args = parser.parse_args()
-    aggregate(args.root, range(args.seed_start, args.seed_end + 1), args.output_dir)
+    aggregate(args.root, range(args.seed_start, args.seed_end + 1), args.output_dir, args.scenes)
 
 
 if __name__ == '__main__':

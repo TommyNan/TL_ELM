@@ -92,9 +92,7 @@ def clip_grad_norm(parameters, max_norm):
     """
     parameters = list(parameters)
     try:
-        return torch.nn.utils.clip_grad_norm_(
-            parameters, max_norm, error_if_nonfinite=False
-        )
+        return torch.nn.utils.clip_grad_norm_(parameters, max_norm, error_if_nonfinite=False)
     except RuntimeError:
         gradients = [p.grad for p in parameters if p.grad is not None]
         norms = torch.stack([torch.linalg.vector_norm(g.double()) for g in gradients])
