@@ -1,6 +1,6 @@
 # ICASSP Cross-Frequency Path-Loss Prediction
 
-This project compares spatial baselines and NeRF-WESN transfer learning on 24 paired radio-map scenes from 15 buildings. Each scene is trained and evaluated independently. The default split uses 10% of valid receiver locations for training and the remaining 90% for testing, with no validation or separate support set. Repetitions use seeds 0 through 9.
+This project compares spatial baselines and NeRF-WESN transfer learning on 10 paired radio-map scenarios from 5 buildings. Each scenario is trained and evaluated independently. The default split uses 10% of valid receiver locations for training and the remaining 90% for testing, with no validation or separate support set. Repetitions use seeds 0 through 9.
 
 MLP trains on min-max normalized PL targets. NeRF2 and NeRF-WESN train directly on the original PL values in dB. Reported RMSE and MAE always use physical PL in dB.
 
@@ -52,7 +52,7 @@ MLP checkpoints save the complete per-band statistics and restore them without r
 
 The MLP baseline uses a **known-range calibration assumption**: its extrema include eventual test labels. NeRF-WESN source pretraining, target fine-tuning and Zero-shot do not use these ranges. Zero-shot uses the source model directly at the target frequency, without target training labels or target PL normalization statistics.
 
-Use new output directories when changing label preprocessing. New NeRF2 and NeRF-WESN checkpoints train on raw PL and do not save label-normalization statistics in their model parameters. The checkpoint prediction and visualization tools still decode older normalized checkpoints using their saved statistics and selected mode. Do not combine older normalized results with new raw-PL results across seeds. Normalization can change optimization, but does not by itself guarantee better accuracy.
+Use separate output directories when changing label preprocessing. NeRF2 and NeRF-WESN checkpoints train on raw PL and do not save label-normalization statistics in their model parameters. Normalization can change optimization, but does not by itself guarantee better accuracy.
 
 ## WESN Training Modes
 
@@ -90,10 +90,14 @@ datasets/ICASSP2025_Paired_Scenes/
     f2_path_loss.png
     f3_path_loss.png
   ...
-  Scene24/
+  Scene10/
     f2_path_loss.png
     f3_path_loss.png
 ```
+
+Experiments use `Scene01` through `Scene10` directly. Each scene's split and initialization are generated from its current scene ID and repetition seed. Train and evaluate all methods anew on these 10 scenarios.
+
+These scenarios were selected after examining earlier experimental results.
 
 The PNG files already contain the original quantized PL values in dB and are not rewritten. Loading them does not divide values by 255 or treat them as RSSI. Only MLP label normalization is applied in memory and reversed for evaluation; NeRF2 and NeRF-WESN use the original dB labels.
 
@@ -104,7 +108,7 @@ The PNG files already contain the original quantized PL values in dB and are not
 - Only actual coincident Tx/Rx locations are excluded from training and evaluation. There is no material-based or PL-value filtering.
 - FSPL uses the true positive Euclidean distance, without a 0.25 m or 1 m distance floor.
 
-For each scene and seed, the training count is `floor(N_valid * train_fraction)`. All remaining valid locations form the test set.
+The retained maps contain 250,218 pixels, with 250,208 valid receiver locations after excluding 10 coincident Tx/Rx locations. For each scene and seed, the training count is `floor(N_valid * train_fraction)`. All remaining valid locations form the test set.
 
 ## Repository Layout
 
@@ -190,7 +194,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHON=python OUT_ROOT=runs/main-raw-direct-10pct \
   bash scripts/run_main_seeds.sh --mode direct_pl --device cuda
 ```
 
-Each output root contains `seed_0/` through `seed_9/`, `logs/seed_N.log`, and the automatically generated `seed_summary/summary.json` and `seed_summary/per_seed.csv`. The wrapper accepts `WESN_MODE`, defaults to `fspl_residual`, and lets `--mode` override that environment setting. Training failures stop the sweep before aggregation; existing results are not overwritten.
+Each output root contains `seed_0/` through `seed_9/`, `logs/seed_N.log`, and the automatically generated `seed_summary/` with `summary.json`, `per_seed.csv`, `per_scene_seed.csv`, and `per_scene_summary.csv`. The wrapper accepts `WESN_MODE`, defaults to `fspl_residual`, and lets `--mode` override that environment setting. Training failures stop the sweep before aggregation; existing results are not overwritten.
 
 Run all seven methods, including the four baselines, with seeds **0 through 9**:
 
@@ -204,7 +208,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHON=python WESN_MODE=direct_pl \
   bash scripts/run_seeds.sh --device cuda
 ```
 
-Compare only the four baselines [For Alex to Run]:
+Compare only the four baselines:
 
 ```bash
 python -m baselines.compare_baselines --seed 0 --device cuda \
@@ -217,7 +221,97 @@ CUDA_VISIBLE_DEVICES=0 TRAIN_FRACTION=0.1 \
 
 The baseline sweep uses `python` from your active environment. With the default settings, run `bash baselines/sweep_baselines.sh` to compare all four baselines over seeds 0-9 and generate the summary.
 
-The sweep scripts accept `PYTHON`, `CONFIG`, `TRAIN_FRACTION`, `OUT_ROOT`, `SEED_START`, and `SEED_END`. Defaults are seeds 0-9 inclusive. For `run_seeds.sh`, an unset `WESN_MODE` preserves the YAML mode. Set `TRAIN_FRACTION=0.2` and choose a new output root for a 20%/80% experiment. Add `--scenes Scene10 Scene11` to select scenes. When MLP is selected, its statistics still cover the complete dataset. Different modes, preprocessing settings, and training budgets should have separate output roots.
+The sweep scripts accept `PYTHON`, `CONFIG`, `TRAIN_FRACTION`, `OUT_ROOT`, `SEED_START`, and `SEED_END`. Defaults are seeds 0-9 inclusive. For `run_seeds.sh`, an unset `WESN_MODE` preserves the YAML mode. Set `TRAIN_FRACTION=0.2` and choose a new output root for a 20%/80% experiment. Add `--scenes Scene02 Scene03` to select scenes. When MLP is selected, its statistics still cover the complete dataset. Different modes, preprocessing settings, and training budgets should have separate output roots.
+
+## Fine-Tuning Label Budgets
+
+Use `scripts/run_finetune_seeds.sh` to compare how much target-band data is needed after source pretraining. The default variants use **0%, 1%, 2%, 5%, and 10% of all valid receiver locations** for target fine-tuning. For example, 1% means approximately one tenth of the available 10% training pool, not 1% of that pool; point counts are rounded down to integers.
+
+For each scene and seed, the original 10% training pool and 90% test set are selected once. Source pretraining always uses the full 10% pool at f2. Target subsets are nested random subsets of that pool. The unused target training locations are left unused; they are not added to the test set. All variants therefore use exactly the same 90% target-band test locations.
+
+Each variant starts independently from the same source weights. The 0% variant is Zero-shot and performs no target optimization. Newly trained nonzero variants use the same requested fine-tuning step count and a fresh Adam optimizer. A smaller budget does not initialize the next larger budget. The reservoir remains fixed, while the WESN readout and radiance MLP are fine-tuned. These budgets measure optimizer steps, not epochs; no validation set is introduced.
+
+The endpoints correspond to the existing main experiments:
+
+| Target fine-tuning fraction | Existing result |
+| --- | --- |
+| 0% | `E4_zero_shot`: the source model evaluated at f3 without fine-tuning |
+| 10% | `E3_transfer`: the source model fine-tuned using the entire 10% training pool |
+
+`E2_scratch` is a separate target-only reference, not a fine-tuning-budget variant.
+
+Run all 10 scenes and seeds 0-9 with 30000 source steps and 30000 fine-tuning steps per nonzero variant:
+
+```bash
+OUT_ROOT=runs/finetune-residual-10scenarios-30000steps \
+  bash scripts/run_finetune_seeds.sh --mode fspl_residual \
+    --pretrain-steps 30000 --target-steps 30000 --device cuda
+
+OUT_ROOT=runs/finetune-direct-10scenarios-30000steps \
+  bash scripts/run_finetune_seeds.sh --mode direct_pl \
+    --pretrain-steps 30000 --target-steps 30000 --device cuda
+```
+
+Without `--source-root`, the source model is trained once per scene and seed, then reused by all variants in that run. If the corresponding main experiment has already finished, reuse its saved source checkpoints instead:
+
+```bash
+OUT_ROOT=runs/finetune-residual-reused-source-30000steps \
+  bash scripts/run_finetune_seeds.sh --mode fspl_residual \
+    --source-root runs/wesn-residual-10scenarios-30000steps \
+    --pretrain-steps 30000 --target-steps 30000 --device cuda
+```
+
+`--source-root` points to the directory containing `seed_0/`, `seed_1/`, and so on. The runner reads each scene's saved source model and split, and requires a compatible source model and split. It normally loads `source_pretrain/final.pt`; if that file is absent, `E4_zero_shot/final.pt` supplies the same pretrained weights. For direct mode, select `--mode direct_pl` and the matching direct source root. Reused pretraining is not rerun; its actual pretraining budget and optimizer settings are recorded from the saved run, rather than replaced by `--pretrain-steps`. Its saved training time is still included in each newly evaluated variant's reported training time, as in the main experiment.
+
+To reuse the already completed **0% and 10% results as well**, add `--reuse-endpoints`. Run the following commands from the project root, not from inside the completed experiment directory:
+
+```bash
+OUT_ROOT=runs/finetune-residual-reused-endpoints-30000steps \
+  bash scripts/run_finetune_seeds.sh --mode fspl_residual \
+    --source-root runs/wesn-residual-10scenarios-30000steps \
+    --reuse-endpoints --target-steps 30000 --device cuda
+
+OUT_ROOT=runs/finetune-direct-reused-endpoints-30000steps \
+  bash scripts/run_finetune_seeds.sh --mode direct_pl \
+    --source-root runs/wesn-direct-10scenarios-30000steps \
+    --reuse-endpoints --target-steps 30000 --device cuda
+```
+
+This keeps all five fractions in the final comparison. The runner copies the original `E4_zero_shot` and `E3_transfer` checkpoints, predictions, and metrics into the 0% and 10% variants **without training or inference at those endpoints**. Only the new 1%, 2%, and 5% variants are fine-tuned and evaluated. Copied endpoint training and test times retain their original measured values.
+
+`--reuse-endpoints` requires `--source-root`. The existing 10% result must match the requested fine-tuning budget, optimizer settings, and test evaluation scope, as well as the source model and split. Set `CONFIG` to the existing run's `seed_0/config.yml` to keep its model and optimizer settings; the wrapper still assigns the appropriate seed to each new run. An incompatible endpoint is rejected before training the intermediate variants for that scene. Without `--reuse-endpoints`, `--source-root` reuses pretraining only; requested target variants are evaluated or fine-tuned again.
+
+Customize the variants with `--fractions`, expressed as decimal fractions of all valid locations:
+
+```bash
+SEED_START=0 SEED_END=4 OUT_ROOT=runs/finetune-residual-custom-5seeds \
+  bash scripts/run_finetune_seeds.sh --mode fspl_residual \
+    --fractions 0 0.01 0.03 0.05 0.1 \
+    --pretrain-steps 30000 --target-steps 30000 --device cuda
+```
+
+Keep `TRAIN_FRACTION=0.1` for the fixed 10%/90% protocol. The wrapper also accepts `PYTHON`, `CONFIG`, `SEED_START`, `SEED_END`, and `OUT_ROOT`; Python options such as `--scenes Scene02` are forwarded to the runner. Use a separate output root for each mode and training budget. This sweep runs only the NeRF-WESN fine-tuning variants; it does not rerun baselines or target-only Scratch experiments.
+
+If only the new intermediate results are needed, pass `--fractions 0.01 0.02 0.05`. The summaries then contain only those three fractions. To produce a complete 0%-to-10% curve using the existing endpoint results, keep the default five fractions and use `--reuse-endpoints` instead.
+
+Each seed saves `finetune_per_scene.csv`, the source model, each variant's checkpoint and predictions, and the selected indices. After the sweep, `seed_summary/` contains:
+
+| File | Contents |
+| --- | --- |
+| `per_seed.csv` | Equal scene means for each seed and target fraction |
+| `per_scene_seed.csv` | Individual scene, seed, and target-fraction results |
+| `per_scene_summary.csv` | Per-scene means and sample standard deviations across seeds |
+| `budget_summary.csv` | Overall means and sample standard deviations for each target fraction |
+| `summary.json` | Aggregation settings and the summarized four metrics |
+| `rmse_mae_vs_finetune_fraction.png` / `.pdf` | RMSE and MAE versus target fraction; error bars show across-seed standard deviation |
+
+Only RMSE, MAE, training time, and test time are reported as performance metrics. Reused endpoint times retain their original measurements; use the same hardware for the new middle budgets when comparing runtime. Aggregation averages scenes equally within a seed before computing across-seed means and sample standard deviations. The curve uses the actual percentages of all valid locations on its x-axis. To regenerate summaries without training:
+
+```bash
+python scripts/aggregate_finetune_budget.py \
+  --root runs/finetune-residual-10scenarios-30000steps \
+  --seed-start 0 --seed-end 9 --output-dir runs/finetune-residual-summary-new
+```
 
 ## Metrics and Outputs
 
@@ -230,16 +324,39 @@ The sweep scripts accept `PYTHON`, `CONFIG`, `TRAIN_FRACTION`, `OUT_ROOT`, `SEED
 
 Scratch training time includes target training. Transfer includes source pretraining plus target fine-tuning; Zero-shot includes source pretraining. The shared source stage executes once per scene and seed, but its cost is attributed to each method that requires it. FSPL training time is zero; KNN fitting time measures tree construction. Timings exclude model initialization and result-file writes, with CUDA synchronization at timing boundaries. Training MSE, whether normalized or in dB-squared, is diagnostic rather than an additional performance metric.
 
-Each seed run saves its configuration, runtime information, common splits, per-scene dB metrics, dB predictions, and neural checkpoints. Runs containing MLP save `label_normalization.json`, and summaries record its calibration statistics. FSPL, KNN, NeRF2 and NeRF-WESN do not apply label normalization. Baseline-only runs also save `baseline_summary.json`. The main sweep writes `seed_summary/summary.json` and `per_seed.csv`; the baseline sweep adds per-scene seed statistics under `sweep_summary/`.
+Each seed run saves its configuration, runtime information, common splits, per-scene dB metrics, dB predictions, and neural checkpoints. Runs containing MLP save `label_normalization.json`, and summaries record its calibration statistics. FSPL, KNN, NeRF2 and NeRF-WESN do not apply label normalization. Baseline-only runs also save `baseline_summary.json`. Main experiments write the following files under `seed_summary/`; baseline sweeps keep their reports under `sweep_summary/`.
 
-Statistics first average scenes equally within each seed, then report the mean and sample standard deviation across seeds. Receiver counts do not determine scene weights. Aggregation checks that per-method label preprocessing and bounds match across seeds; do not mix older normalized NeRF2/WESN results with their new raw-label results.
+| File | Contents |
+| --- | --- |
+| `summary.json` | Overall and per-scene statistics |
+| `per_seed.csv` | Equal scene means for each seed and method |
+| `per_scene_seed.csv` | Individual scene, seed, and method results |
+| `per_scene_summary.csv` | Mean and sample standard deviation across seeds for each scene and method |
 
-Reaggregate existing main experiments into a new directory:
+The main per-scene summary includes `scene_id`, `building_id`, `group`, `approach`, and `n_seeds`, followed by `_mean` and `_std` columns for the four metrics. For example, filter `approach` to `E3_transfer` and compare `rmse_db_mean` across scenes in a spreadsheet. A 10-scene, three-method main experiment produces 30 summary rows.
+
+Statistics first average scenes equally within each seed, then report the mean and sample standard deviation across seeds. Receiver counts do not determine scene weights. Aggregation checks that per-method label preprocessing and bounds match across seeds.
+
+Reaggregate completed repetitions into a separate summary directory:
 
 ```bash
-python scripts/aggregate_seeds.py --root runs/main-raw-residual-10pct \
-  --seed-start 0 --seed-end 9 --output-dir runs/main-raw-residual-10pct/rechecked
+RUN_ROOT=runs/main-raw-direct-10pct
+python scripts/aggregate_seeds.py --root "$RUN_ROOT" \
+  --seed-start 0 --seed-end 9 --output-dir "$RUN_ROOT/seed_summary_per_scene"
 ```
+
+For residual-mode results, use `runs/main-raw-residual-10pct` as `RUN_ROOT`.
+
+To summarize only selected scenes and recompute the overall metrics for that subset:
+
+```bash
+RUN_ROOT=runs/main-raw-direct-10pct
+python scripts/aggregate_seeds.py --root "$RUN_ROOT" \
+  --seed-start 0 --seed-end 9 --scenes Scene01 Scene02 Scene03 \
+  --output-dir "$RUN_ROOT/seed_summary_selected"
+```
+
+Scene filtering reads the saved per-scene results and recomputes the summary without training models or changing the stored runs.
 
 Generate a shared-scale comparison figure from saved models:
 

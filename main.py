@@ -201,6 +201,7 @@ def run_scene(scene, split, methods, config, out, device, seed, baseline_names, 
         (scene_dir / "source_pretrain/history.json").write_text(json.dumps(history, indent=2))
         del source
 
+    # Training - Proposed methods
     rows = []
     for method in methods:
         model = new_model(params, seed, device)
@@ -244,16 +245,20 @@ def run_scene(scene, split, methods, config, out, device, seed, baseline_names, 
         print(f'{scene.scene_id} {method}: RMSE={record["rmse_db"]:.3f}, MAE={record["mae_db"]:.3f} dB', flush=True)
         del model
 
+    # Training - Baselines
     baseline_rows = []
     for name in baseline_names:
         dest = scene_dir / "baselines" / name
         history, model, initial_digest = [], None, None
         train_seconds, target_steps = 0.0, 0
         measured_count = len(train_indices)
+
+        # Baseline: Free Space Path Loss (FSPL)
         if name == "E1_fspl":
             parameters = dict(tx_m=scene.tx_m.tolist(), frequency_ghz=data["target_frequency_ghz"])
             baseline = FSPL(**parameters)
             model_type, measured_count = "fspl", 0
+        # Baseline: KNN
         elif name == "B1_knn":
             parameters = dict(config["baseline"]["knn"])
             baseline = KNN(**parameters)

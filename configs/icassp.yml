@@ -1,5 +1,6 @@
 # Latest protocol: E2 scratch, E3 sequential transfer, E4 zero-shot.
 data:
+  # 10 scenarios across 5 buildings: Scene01–Scene10.
   root: datasets/ICASSP2025_Paired_Scenes
   source_band: f2
   target_band: f3
@@ -12,7 +13,7 @@ data:
   support_fraction: 0.0
 model:
   attenuation: wesn
-  # fspl_residual: FSPL + learned correction; direct_pl: predict full PL directly.
+  # Both modes use raw PL dB labels: FSPL + a dB residual, or direct full PL dB.
   prediction_mode: fspl_residual
   num_rays: 8
   num_samples: 16
@@ -20,8 +21,8 @@ model:
   # Coordinate Fourier scales; carrier frequency is a separate log-frequency feature.
   num_freq: 4
 train:
-  pretrain_steps: 10000
-  target_steps: 10000
+  pretrain_steps: 30000
+  target_steps: 30000
   pretrain_lr: 0.001
   target_lr: 0.001
   # Same target optimizer settings for scratch and transfer by default.
@@ -39,16 +40,18 @@ baseline:
   # Ordinary uniform KNN directly predicts full PL from the shared f3 observations.
   # Analytical FSPL uses no path-loss observations and needs no fit configuration.
   knn:
-    k: 5
+    k: 10
     batch_size: 4096
 baseline_models:
-  # Both neural baselines directly predict full PL dB, without an FSPL prior.
+  # Both baselines predict complete PL, without an FSPL prior.
   B2_mlp:
+    # Fit Min-Max-normalized labels; inverse-scale predictions to dB.
     # Inputs: Rx xyz + Tx xyz + log frequency (7); x/y normalized, z in metres.
     hidden_dim: 128
     num_layers: 4
   B3_nerf2:
+    # Fit the original PL labels in dB; no label normalization.
     hidden_dim: 256
     mlp_num_layers: 8
     mlp_skips: [4]
-output_dir: runs/wesn-fspl-residual-minmax-10pct
+output_dir: runs/wesn-fspl-residual-raw-pl-10pct
